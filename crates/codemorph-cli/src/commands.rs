@@ -167,31 +167,127 @@ pub fn migrate(input: PathBuf, output: PathBuf) {
         eprintln!("input does not exist");
         return;
     }
+
     let ir = codemorph_project::analyze(&input);
     println!("analyzed files: {}", ir.files.len());
     let mut by_lang = std::collections::BTreeMap::new();
     for f in &ir.files {
         *by_lang.entry(f.language.clone()).or_insert(0usize) += 1;
     }
-    for (lang, n) in by_lang {
+    for (lang, n) in &by_lang {
         println!("  {}: {}", lang, n);
     }
+
     std::fs::create_dir_all(&output).ok();
-    let mut job = codemorph_orchestrate::MigrationJob::new(
-        "migrate",
-        input.display().to_string(),
-        output.display().to_string(),
-    );
-    job.state = codemorph_core::pipeline::PipelineState::AnalyzeProject;
-    let _ = job.advance_deterministic();
-    let _ = job.advance_deterministic();
-    let state_path = codemorph_orchestrate::state_path(&output);
-    if let Some(parent) = state_path.parent() {
-        std::fs::create_dir_all(parent).ok();
+    let mut source_files = Vec::new();
+    if input.is_file() {
+        source_files.push(input.clone());
+    } else {
+        fn walk(dir: &PathBuf, out: &mut Vec<PathBuf>) {
+            if let Ok(read) = std::fs::read_dir(dir) {
+                for entry in read.flatten() {
+                    let p = entry.path();
+                    if p.is_dir() {
+                        walk(&p, out);
+                    } else if let Some(ext) = p.extension().and_then(|x| x.to_str()) {
+                        if matches!(ext, "cpp" | "cc" | "cxx" | "c" | "h" | "hpp") {
+                            out.push(p);
+                        }
+                    }
+                }
+            }
+        }
+        walk(&input, &mut source_files);
     }
-    let _ = job.save(&state_path);
-    println!("state: {}", state_path.display());
-    println!("status: project analysis complete; translation stage not yet automated");
+
+    let model = std::env::var("CODEMORPH_OLLAMA_MODEL").unwrap_or_else(|_| "beam:cloud".to_string());
+    println!("translator backend: Ollama {}", model);
+
+    let mut manifest: Vec<serde_json::Value> = Vec::new();
+    let mut translated = 0usize;
+    let mut failed = 0usize;
+    let source_files_is_empty = source_files.is_empty();
+    for source_path in &source_files {
+        let rel = if input.is_dir() {
+            source_path.strip_prefix(&input).unwrap_or(source_path).to_path_buf()
+        } else {
+            source_path.file_name().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("input.rs"))
+        };
+        let out_path = output.join(rel.with_extension("rs"));
+        if let Some(parent) = out_path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+
+        let source_cpp = match std::fs::read_to_string(source_path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("cannot read {}: {}", source_path.display(), e);
+                failed += 1;
+                continue;
+            }
+        };
+
+        print!("translating {} ... ", source_path.display());
+        let candidate = match ollama_generate(&model, &build_translation_prompt(&source_cpp), 300_000) {
+            Ok(x) => clean_text(&x),
+            Err(e) => {
+                println!("FAILED ({e})");
+                failed += 1;
+                continue;
+            }
+        };
+
+        let compile_ok = write_and_check_rust(&out_path, &candidate);
+        if !compile_ok {
+            print!("repairing {} ... ", out_path.display());
+            let repair_prompt = format!(
+                "The following Rust did not compile. Return only corrected Rust code.\n\nRust:\n```rust\n{}\n```",
+                candidate
+            );
+            if let Ok(repaired) = ollama_generate(&model, &repair_prompt, 300_000) {
+                let repaired = clean_text(&repaired);
+                if write_and_check_rust(&out_path, &repaired) {
+                    println!("compiled after repair");
+                    translated += 1;
+                } else {
+                    println!("still failed");
+                    failed += 1;
+                }
+            } else {
+                println!("repair generation failed");
+                failed += 1;
+            }
+        } else {
+            println!("compiled");
+            translated += 1;
+        }
+
+        manifest.push(serde_json::json!({
+            "source": source_path.display().to_string(),
+            "output": out_path.display().to_string(),
+            "model": model,
+        }));
+    }
+
+    let report = serde_json::json!({
+        "input": input.display().to_string(),
+        "output": output.display().to_string(),
+        "translated": translated,
+        "failed": failed,
+        "files": manifest,
+    });
+    std::fs::create_dir_all(output.join(".codemorph")).ok();
+    let report_path = output.join(".codemorph").join("migration-report.json");
+    let _ = std::fs::write(&report_path, serde_json::to_string_pretty(&report).unwrap_or_default());
+
+    println!("translated: {}", translated);
+    println!("failed: {}", failed);
+    println!("report: {}", report_path.display());
+    if source_files_is_empty {
+        println!("status: no source files found");
+    } else {
+        println!("status: migration attempt completed");
+    }
 }
 
 pub fn models_list() {
@@ -304,3 +400,60 @@ pub fn benchmark(
     println!("rust_mean_ms: {:.3}", rust_mean);
     println!("rust_over_cpp_ratio: {:.3}", ratio);
 }
+
+
+fn build_translation_prompt(source_cpp: &str) -> String {
+    format!(
+        "Translate the following C/C++ code into a complete Rust program. Preserve behavior, signatures, and main when present. Return only Rust code, no markdown, no explanation.\n\n{}",
+        source_cpp
+    )
+}
+
+fn clean_text(text: &str) -> String {
+    let mut lines = text.trim().lines().collect::<Vec<_>>();
+    if lines.first().map(|x| x.trim().starts_with("```")).unwrap_or(false) {
+        lines.remove(0);
+    }
+    while lines.last().map(|x| x.trim().starts_with("```")).unwrap_or(false) {
+        lines.pop();
+    }
+    lines.join("\n").trim().to_string()
+}
+
+fn ollama_generate(model: &str, prompt: &str, timeout_ms: u64) -> Result<String, String> {
+    use codemorph_core::sandbox::{ExecutionLimits, ExecutionRequest};
+    use codemorph_sandbox::Sandbox;
+
+    let req = ExecutionRequest {
+        program: "ollama".to_string(),
+        args: vec![
+            "run".to_string(),
+            model.to_string(),
+            "--hidethinking".to_string(),
+            "--nowordwrap".to_string(),
+            prompt.to_string(),
+        ],
+        cwd: None,
+        env: vec![],
+        stdin: None,
+        limits: ExecutionLimits { timeout_ms, ..Default::default() },
+    };
+    let res = Sandbox::execute(&req).map_err(|e| e.to_string())?;
+    if res.timed_out {
+        return Err("ollama timeout".to_string());
+    }
+    if res.exit_code != Some(0) {
+        return Err(res.stderr);
+    }
+    Ok(res.stdout)
+}
+
+fn write_and_check_rust(path: &std::path::Path, source: &str) -> bool {
+    if std::fs::write(path, source).is_err() {
+        return false;
+    }
+    let tmp_out = path.with_extension("out");
+    let result = codemorph_rustlang::RustAdapter::new().compile_text(source, Some(tmp_out));
+    result.success
+}
+
