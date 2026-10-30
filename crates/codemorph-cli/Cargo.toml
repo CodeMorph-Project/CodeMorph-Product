@@ -1,0 +1,29 @@
+[package]
+name = "codemorph"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "codemorph"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+codemorph-core = { path = "../codemorph-core" }
+tempfile.workspace = true
+which.workspace = true
+codemorph-ir = { path = "../codemorph-ir" }
+codemorph-project = { path = "../codemorph-project" }
+codemorph-verify = { path = "../codemorph-verify" }
+codemorph-orchestrate = { path = "../codemorph-orchestrate" }
+codemorph-models = { path = "../codemorph-models" }
+codemorph-sandbox = { path = "../codemorph-sandbox" }
+codemorph-cpp = { path = "../codemorph-cpp" }
+codemorph-rustlang = { path = "../codemorph-rustlang" }
