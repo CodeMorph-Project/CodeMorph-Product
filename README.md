@@ -66,3 +66,25 @@ models/<role>/manifest.json
 
 Models are not trained in product runtime. They are installed from a
 CodeMorph Lab release bundle with `tools/install_models.py`.
+
+## Quick start
+
+Install a translator model into the runtime registry:
+
+```sh
+export CODEMORPH_OLLAMA_MODEL=beam:cloud
+```
+
+Run migration:
+
+```sh
+codemorph migrate ./cpp-project --output ./rust-project
+```
+
+Each supported source file is translated with Ollama, checked with
+`rustc`, and optionally repaired once using compiler diagnostics. The final
+report is written to:
+
+```text
+rust-project/.codemorph/migration-report.json
+```
