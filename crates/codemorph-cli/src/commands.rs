@@ -161,6 +161,42 @@ pub fn diff_test(
     }
 }
 
+
+fn generate_translation(prompt: &str, allow_local: bool) -> Result<String, String> {
+    let models_root = std::env::var("CODEMORPH_MODELS_ROOT").unwrap_or_else(|_| "models".to_string());
+    let translator_dir = std::path::PathBuf::from(&models_root).join("translator");
+    let manifest_path = translator_dir.join("manifest.json");
+    if allow_local && manifest_path.exists() {
+        let manifest = std::fs::read_to_string(&manifest_path).unwrap_or_default();
+        if manifest.contains("python-torch") {
+            let python = std::env::var("CODEMORPH_PYTHON").unwrap_or_else(|_| "python3.12".to_string());
+            let mut pythonpath = std::env::var("CODEMORPH_PYTHONPATH").unwrap_or_else(|_| "python".to_string());
+            if !std::path::Path::new(&pythonpath).exists() {
+                pythonpath = ".".to_string();
+            }
+            let env = vec![("PYTHONPATH".to_string(), pythonpath)];
+            use codemorph_core::sandbox::{ExecutionLimits, ExecutionRequest};
+            use codemorph_sandbox::Sandbox;
+            let req = ExecutionRequest {
+                program: python.clone(),
+                args: vec!["-m".to_string(), "codemorph_ml.inference".to_string(), "--model-dir".to_string(), translator_dir.display().to_string(), "--source-text".to_string(), prompt.to_string()],
+                cwd: None,
+                env: env.clone(),
+                stdin: None,
+                limits: ExecutionLimits { timeout_ms: 300_000, ..Default::default() },
+            };
+            let res = Sandbox::execute(&req).map_err(|e| e.to_string())?;
+            if res.timed_out { return Err("python inference timeout".to_string()); }
+            if res.exit_code != Some(0) { return Err(res.stderr); }
+            return Ok(res.stdout);
+        }
+    }
+
+    // Fall back to the Ollama teacher backend.
+    let model = std::env::var("CODEMORPH_OLLAMA_MODEL").unwrap_or_else(|_| "beam:cloud".to_string());
+    ollama_generate(&model, prompt, 300_000)
+}
+
 pub fn migrate(input: PathBuf, output: PathBuf) {
     println!("Analyzing {}", input.display());
     if !input.exists() {
@@ -200,8 +236,7 @@ pub fn migrate(input: PathBuf, output: PathBuf) {
         walk(&input, &mut source_files);
     }
 
-    let model = std::env::var("CODEMORPH_OLLAMA_MODEL").unwrap_or_else(|_| "beam:cloud".to_string());
-    println!("translator backend: Ollama {}", model);
+    println!("translator backend: auto (local artifact or Ollama)");
 
     let mut manifest: Vec<serde_json::Value> = Vec::new();
     let mut translated = 0usize;
@@ -228,7 +263,7 @@ pub fn migrate(input: PathBuf, output: PathBuf) {
         };
 
         print!("translating {} ... ", source_path.display());
-        let candidate = match ollama_generate(&model, &build_translation_prompt(&source_cpp), 300_000) {
+        let candidate = match generate_translation(&build_translation_prompt(&source_cpp), true) {
             Ok(x) => clean_text(&x),
             Err(e) => {
                 println!("FAILED ({e})");
@@ -244,7 +279,7 @@ pub fn migrate(input: PathBuf, output: PathBuf) {
                 "The following Rust did not compile. Return only corrected Rust code.\n\nRust:\n```rust\n{}\n```",
                 candidate
             );
-            if let Ok(repaired) = ollama_generate(&model, &repair_prompt, 300_000) {
+            if let Ok(repaired) = generate_translation(&repair_prompt, false) {
                 let repaired = clean_text(&repaired);
                 if write_and_check_rust(&out_path, &repaired) {
                     println!("compiled after repair");
@@ -265,7 +300,7 @@ pub fn migrate(input: PathBuf, output: PathBuf) {
         manifest.push(serde_json::json!({
             "source": source_path.display().to_string(),
             "output": out_path.display().to_string(),
-            "model": model,
+            "model": "auto",
         }));
     }
 
