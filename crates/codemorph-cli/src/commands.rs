@@ -271,15 +271,37 @@ fn deterministic_translation(source: &str) -> Option<String> {
         out.push_str(line);
         out.push(' ');
     }
-    // Convert every `std::cout << expr;` into `println!("{}", expr);`.
+    // Convert every `std::cout << expr;` into the closest Rust output.
     while let Some(start) = out.find("std::cout << ") {
         let prefix = out[..start].to_string();
         let rest = &out[start..];
         if let Some(end) = rest.find(';') {
             let mut expr = rest["std::cout << ".len()..end].trim().to_string();
-            expr = expr.replace(r#" << "\n""#, "");
+            let mut trailing_newline = false;
+            // Drop stream newline tokens appended to C++ ostream.
+            if expr.ends_with(r#" << "\n""#) {
+                trailing_newline = true;
+                expr = expr[..expr.len() - r#" << "\n""#.len()].trim().to_string();
+            }
+            if expr.ends_with(" << std::endl") {
+                trailing_newline = true;
+                expr = expr[..expr.len() - " << std::endl".len()].trim().to_string();
+            }
+            // Remove newline inside a trailing C++ string so println! adds exactly one.
+            if expr.starts_with('"') && expr.ends_with('"') && expr.contains(r#"\n"#) {
+                trailing_newline = true;
+                let mut chars: Vec<char> = expr.chars().collect();
+                // delete the trailing \n before the closing quote
+                if chars.len() >= 4 && chars[chars.len() - 3] == '\\' && chars[chars.len() - 2] == 'n' && chars[chars.len() - 1] == '"' {
+                    chars.remove(chars.len() - 3);
+                    chars.remove(chars.len() - 2);
+                }
+                expr = chars.into_iter().collect::<String>();
+            }
             let remain = &rest[end + 1..];
-            out = format!("{}println!(\"{{}}\", {});{}", prefix, expr, remain);
+            let macro_name = if trailing_newline { "println" } else { "print" };
+            let statement = format!("{}!(\"{{}}\", {});", macro_name, expr);
+            out = format!("{}{}{}", prefix, statement, remain);
         } else {
             break;
         }
@@ -670,4 +692,5 @@ fn behavior_check(cpp_source: &str, rust_source: &str, cases: usize, seed: u64) 
     }
     (passed == cases.max(1) as u64 && cases > 0, passed)
 }
+
 
