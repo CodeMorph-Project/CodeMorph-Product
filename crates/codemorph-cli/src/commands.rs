@@ -264,22 +264,28 @@ fn deterministic_translation(source: &str) -> Option<String> {
         return None;
     }
     let mut out = String::new();
-    // Basic preprocessing: drop common C++ includes.
     for line in source.lines() {
         let line = line.trim();
         if line.starts_with("#include") { continue; }
         if line == "using namespace std;" { continue; }
         out.push_str(line);
-        out.push('\n');
+        out.push(' ');
     }
-    // Minimal syntactic conversions.
+    // Convert every `std::cout << expr;` into `println!("{}", expr);`.
+    while let Some(start) = out.find("std::cout << ") {
+        let prefix = out[..start].to_string();
+        let rest = &out[start..];
+        if let Some(end) = rest.find(';') {
+            let mut expr = rest["std::cout << ".len()..end].trim().to_string();
+            expr = expr.replace(r#" << "\n""#, "");
+            let remain = &rest[end + 1..];
+            out = format!("{}println!(\"{{}}\", {});{}", prefix, expr, remain);
+        } else {
+            break;
+        }
+    }
     out = out.replace("int main(){", "fn main() {");
     out = out.replace("int main() {", "fn main() {");
-    out = out.replace("std::cout << ", r#"println!("{}", "#);
-    out = out.replace(" << std::endl;", ");");
-    out = out.replace(" << \"\\n\";", ");");
-    out = out.replace("std::cout << ", r#"println!("{}", "#);
-    // A trailing bare return 0 is removed for Rust main unit.
     out = out.replace("return 0;", "");
     if out.contains("fn main") {
         if !out.trim_end().ends_with('}') {
