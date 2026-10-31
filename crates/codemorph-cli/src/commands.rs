@@ -235,7 +235,7 @@ pub fn migrate(input: PathBuf, output: PathBuf) {
         walk(&input, &mut source_files);
     }
 
-    println!("translator backend: auto (local artifact or Ollama)");
+    println!("translator backend: local-first (fallback to Ollama if needed)");
 
     let mut manifest: Vec<serde_json::Value> = Vec::new();
     let mut translated = 0usize;
