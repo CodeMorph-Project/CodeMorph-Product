@@ -166,7 +166,7 @@ fn generate_translation(prompt: &str, allow_local: bool) -> Result<String, Strin
     let models_root = std::env::var("CODEMORPH_MODELS_ROOT").unwrap_or_else(|_| "models".to_string());
     let translator_dir = std::path::PathBuf::from(&models_root).join("translator");
     let manifest_path = translator_dir.join("manifest.json");
-    if allow_local && manifest_path.exists() {
+    if allow_local && std::env::var("CODEMORPH_USE_LOCAL_MODEL").unwrap_or_default() == "1" && manifest_path.exists() {
         let manifest = std::fs::read_to_string(&manifest_path).unwrap_or_default();
         if manifest.contains("python-torch") {
             let python = std::env::var("CODEMORPH_PYTHON").unwrap_or_else(|_| "python3.12".to_string());
@@ -192,9 +192,8 @@ fn generate_translation(prompt: &str, allow_local: bool) -> Result<String, Strin
         }
     }
 
-    // Fall back to the Ollama teacher backend.
     let model = std::env::var("CODEMORPH_OLLAMA_MODEL").unwrap_or_else(|_| "beam:cloud".to_string());
-    ollama_generate(&model, prompt, 300_000)
+    python_ollama_generate(&model, prompt)
 }
 
 pub fn migrate(input: PathBuf, output: PathBuf) {
@@ -455,31 +454,43 @@ fn clean_text(text: &str) -> String {
     lines.join("\n").trim().to_string()
 }
 
-fn ollama_generate(model: &str, prompt: &str, timeout_ms: u64) -> Result<String, String> {
+
+fn python_ollama_generate(model: &str, prompt: &str) -> Result<String, String> {
     use codemorph_core::sandbox::{ExecutionLimits, ExecutionRequest};
     use codemorph_sandbox::Sandbox;
 
+    let python = std::env::var("CODEMORPH_PYTHON").unwrap_or_else(|_| "python3".to_string());
+    let mut pythonpath = std::env::var("CODEMORPH_PYTHONPATH").unwrap_or_else(|_| "python".to_string());
+    if !std::path::Path::new(&pythonpath).exists() {
+        pythonpath = ".".to_string();
+    }
+
+    let script = r#"
+import os, sys
+os.environ.setdefault("CODEMORPH_OLLAMA_HOST", "http://localhost:11434")
+os.environ.setdefault("CODEMORPH_TEACHER_MODEL", sys.argv[1])
+sys.path.insert(0, os.environ.get("PYTHONPATH", "."))
+from codemorph_ml.ollama_client import OllamaTeacher
+teacher = OllamaTeacher(OllamaTeacher.from_env())
+prompt = sys.stdin.read()
+candidates = teacher.generate_candidates(prompt, candidate_count=1)
+print(candidates[0].text, end="")
+"#
+    .to_string();
+
+    let env = vec![("PYTHONPATH".to_string(), pythonpath)];
     let req = ExecutionRequest {
-        program: "ollama".to_string(),
-        args: vec![
-            "run".to_string(),
-            model.to_string(),
-            "--hidethinking".to_string(),
-            "--nowordwrap".to_string(),
-            prompt.to_string(),
-        ],
+        program: python.clone(),
+        args: vec!["-c".to_string(), script, model.to_string()],
         cwd: None,
-        env: vec![],
-        stdin: None,
-        limits: ExecutionLimits { timeout_ms, ..Default::default() },
+        env,
+        stdin: Some(prompt.to_string()),
+        limits: ExecutionLimits { timeout_ms: 300_000, ..Default::default() },
     };
     let res = Sandbox::execute(&req).map_err(|e| e.to_string())?;
-    if res.timed_out {
-        return Err("ollama timeout".to_string());
-    }
-    if res.exit_code != Some(0) {
-        return Err(res.stderr);
-    }
+    if res.timed_out { return Err("python ollama timeout".to_string()); }
+    if res.exit_code != Some(0) { return Err(res.stderr); }
+    if res.stdout.trim().is_empty() { return Err(format!("empty result; stderr={}", res.stderr)); }
     Ok(res.stdout)
 }
 
