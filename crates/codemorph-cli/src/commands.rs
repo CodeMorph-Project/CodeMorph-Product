@@ -166,7 +166,7 @@ fn generate_translation(prompt: &str, allow_local: bool) -> Result<String, Strin
     let models_root = std::env::var("CODEMORPH_MODELS_ROOT").unwrap_or_else(|_| "models".to_string());
     let translator_dir = std::path::PathBuf::from(&models_root).join("translator");
     let manifest_path = translator_dir.join("manifest.json");
-    if allow_local && std::env::var("CODEMORPH_USE_LOCAL_MODEL").unwrap_or_default() == "1" && manifest_path.exists() {
+    if allow_local && manifest_path.exists() {
         let manifest = std::fs::read_to_string(&manifest_path).unwrap_or_default();
         if manifest.contains("python-torch") {
             let python = std::env::var("CODEMORPH_PYTHON").unwrap_or_else(|_| "python3.12".to_string());
@@ -275,8 +275,8 @@ pub fn migrate(input: PathBuf, output: PathBuf) {
         if !compile_ok {
             print!("repairing {} ... ", out_path.display());
             let repair_prompt = format!(
-                "The following Rust did not compile. Return only corrected Rust code.\n\nRust:\n```rust\n{}\n```",
-                candidate
+                "You are repairing Rust code. Return ONLY complete valid Rust source, no markdown and no explanation. Original C++:\n```cpp\n{}\n```\nBroken Rust:\n```rust\n{}\n```",
+                source_cpp, candidate
             );
             if let Ok(repaired) = generate_translation(&repair_prompt, false) {
                 let repaired = clean_text(&repaired);
