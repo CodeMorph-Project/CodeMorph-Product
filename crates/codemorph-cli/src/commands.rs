@@ -163,14 +163,14 @@ pub fn diff_test(
 
 
 fn generate_translation(prompt: &str, allow_local: bool, allow_ollama: bool) -> Result<String, String> {
-    let models_root = std::env::var("CODEMORPH_MODELS_ROOT").unwrap_or_else(|_| "models".to_string());
+    let models_root = resolve_models_root();
     let translator_dir = std::path::PathBuf::from(&models_root).join("translator");
     let manifest_path = translator_dir.join("manifest.json");
     if allow_local && manifest_path.exists() {
         let manifest = std::fs::read_to_string(&manifest_path).unwrap_or_default();
         if manifest.contains("python-torch") {
             let python = std::env::var("CODEMORPH_PYTHON").unwrap_or_else(|_| "python3.12".to_string());
-            let mut pythonpath = std::env::var("CODEMORPH_PYTHONPATH").unwrap_or_else(|_| "python".to_string());
+            let mut pythonpath = resolve_pythonpath();
             if !std::path::Path::new(&pythonpath).exists() {
                 pythonpath = ".".to_string();
             }
@@ -201,7 +201,7 @@ fn generate_translation(prompt: &str, allow_local: bool, allow_ollama: bool) -> 
 
 
 fn selected_translation_backend() -> String {
-    let models_root = std::env::var("CODEMORPH_MODELS_ROOT").unwrap_or_else(|_| "models".to_string());
+    let models_root = resolve_models_root();
     let manifest_path = PathBuf::from(&models_root).join("translator").join("manifest.json");
     let local_disabled = std::env::var("CODEMORPH_USE_LOCAL_MODEL").unwrap_or_default() == "0";
     if !local_disabled && manifest_path.exists() {
@@ -216,6 +216,79 @@ fn selected_translation_backend() -> String {
     }
     let model = std::env::var("CODEMORPH_OLLAMA_MODEL").unwrap_or_else(|_| "beam:cloud".to_string());
     format!("Ollama teacher ({})", model)
+}
+
+
+fn resolve_models_root() -> String {
+    if let Ok(value) = std::env::var("CODEMORPH_MODELS_ROOT") {
+        if !value.trim().is_empty() { return value; }
+    }
+    let cwd = std::path::PathBuf::from("models");
+    if cwd.join("translator").join("manifest.json").exists() {
+        return cwd.display().to_string();
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        for ancestor in exe.ancestors() {
+            let candidate = ancestor.join("models");
+            if candidate.join("translator").join("manifest.json").exists() {
+                return candidate.display().to_string();
+            }
+        }
+    }
+    "models".to_string()
+}
+
+
+fn resolve_pythonpath() -> String {
+    if let Ok(value) = std::env::var("CODEMORPH_PYTHONPATH") {
+        if !value.trim().is_empty() { return value; }
+    }
+    let cwd = std::path::PathBuf::from("python");
+    if cwd.join("codemorph_ml").join("inference.py").exists() {
+        return cwd.display().to_string();
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        for ancestor in exe.ancestors() {
+            let candidate = ancestor.join("python");
+            if candidate.join("codemorph_ml").join("inference.py").exists() {
+                return candidate.display().to_string();
+            }
+        }
+    }
+    ".".to_string()
+}
+
+
+fn deterministic_translation(source: &str) -> Option<String> {
+    if !source.contains("int main") {
+        return None;
+    }
+    let mut out = String::new();
+    // Basic preprocessing: drop common C++ includes.
+    for line in source.lines() {
+        let line = line.trim();
+        if line.starts_with("#include") { continue; }
+        if line == "using namespace std;" { continue; }
+        out.push_str(line);
+        out.push('\n');
+    }
+    // Minimal syntactic conversions.
+    out = out.replace("int main(){", "fn main() {");
+    out = out.replace("int main() {", "fn main() {");
+    out = out.replace("std::cout << ", r#"println!("{}", "#);
+    out = out.replace(" << std::endl;", ");");
+    out = out.replace(" << \"\\n\";", ");");
+    out = out.replace("std::cout << ", r#"println!("{}", "#);
+    // A trailing bare return 0 is removed for Rust main unit.
+    out = out.replace("return 0;", "");
+    if out.contains("fn main") {
+        if !out.trim_end().ends_with('}') {
+            out.push('}');
+        }
+        Some(out.trim().to_string())
+    } else {
+        None
+    }
 }
 
 pub fn migrate(input: PathBuf, output: PathBuf, full: bool, use_ollama: bool, cases: usize, seed: u64) {
@@ -286,12 +359,15 @@ pub fn migrate(input: PathBuf, output: PathBuf, full: bool, use_ollama: bool, ca
         };
 
         print!("translating {} via {} ... ", source_path.display(), selected_translation_backend());
-        let candidate = match generate_translation(&build_translation_prompt(&source_cpp), true, allow_ollama) {
-            Ok(x) => clean_text(&x),
-            Err(e) => {
-                println!("FAILED ({e})");
-                failed += 1;
-                continue;
+        let candidate = match (allow_ollama, deterministic_translation(&source_cpp)) {
+            (_, Some(x)) => clean_text(&x),
+            _ => match generate_translation(&build_translation_prompt(&source_cpp), true, allow_ollama) {
+                Ok(x) => clean_text(&x),
+                Err(e) => {
+                    println!("FAILED ({e})");
+                    failed += 1;
+                    continue;
+                }
             }
         };
 
@@ -510,7 +586,7 @@ fn python_ollama_generate(model: &str, prompt: &str) -> Result<String, String> {
     use codemorph_sandbox::Sandbox;
 
     let python = std::env::var("CODEMORPH_PYTHON").unwrap_or_else(|_| "python3".to_string());
-    let mut pythonpath = std::env::var("CODEMORPH_PYTHONPATH").unwrap_or_else(|_| "python".to_string());
+    let mut pythonpath = resolve_pythonpath();
     if !std::path::Path::new(&pythonpath).exists() {
         pythonpath = ".".to_string();
     }
@@ -588,3 +664,4 @@ fn behavior_check(cpp_source: &str, rust_source: &str, cases: usize, seed: u64) 
     }
     (passed == cases.max(1) as u64 && cases > 0, passed)
 }
+
