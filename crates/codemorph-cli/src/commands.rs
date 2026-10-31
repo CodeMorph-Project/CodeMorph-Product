@@ -196,6 +196,25 @@ fn generate_translation(prompt: &str, allow_local: bool) -> Result<String, Strin
     python_ollama_generate(&model, prompt)
 }
 
+
+fn selected_translation_backend() -> String {
+    let models_root = std::env::var("CODEMORPH_MODELS_ROOT").unwrap_or_else(|_| "models".to_string());
+    let manifest_path = PathBuf::from(&models_root).join("translator").join("manifest.json");
+    let local_disabled = std::env::var("CODEMORPH_USE_LOCAL_MODEL").unwrap_or_default() == "0";
+    if !local_disabled && manifest_path.exists() {
+        let manifest = std::fs::read_to_string(&manifest_path).unwrap_or_default();
+        if manifest.contains("python-torch") {
+            let model_id = serde_json::from_str::<serde_json::Value>(&manifest)
+                .ok()
+                .and_then(|v| v.get("model_id").and_then(|x| x.as_str()).map(str::to_string))
+                .unwrap_or_else(|| "local-torch".to_string());
+            return format!("local trained model ({})", model_id);
+        }
+    }
+    let model = std::env::var("CODEMORPH_OLLAMA_MODEL").unwrap_or_else(|_| "beam:cloud".to_string());
+    format!("Ollama teacher ({})", model)
+}
+
 pub fn migrate(input: PathBuf, output: PathBuf) {
     println!("Analyzing {}", input.display());
     if !input.exists() {
@@ -235,7 +254,7 @@ pub fn migrate(input: PathBuf, output: PathBuf) {
         walk(&input, &mut source_files);
     }
 
-    println!("translator backend: local-first (fallback to Ollama if needed)");
+    println!("translator backend selected: {}", selected_translation_backend());
 
     let mut manifest: Vec<serde_json::Value> = Vec::new();
     let mut translated = 0usize;
@@ -261,7 +280,7 @@ pub fn migrate(input: PathBuf, output: PathBuf) {
             }
         };
 
-        print!("translating {} ... ", source_path.display());
+        print!("translating {} via {} ... ", source_path.display(), selected_translation_backend());
         let candidate = match generate_translation(&build_translation_prompt(&source_cpp), true) {
             Ok(x) => clean_text(&x),
             Err(e) => {
