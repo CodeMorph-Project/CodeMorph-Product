@@ -53,6 +53,14 @@ enum Commands {
         input: PathBuf,
         #[arg(long)]
         output: PathBuf,
+        #[arg(long)]
+        full: bool,
+        #[arg(long)]
+        use_ollama: bool,
+        #[arg(long, default_value = "20")]
+        cases: usize,
+        #[arg(long, default_value = "7")]
+        seed: u64,
     },
     Models {
         #[command(subcommand)]
@@ -90,7 +98,7 @@ fn main() {
             input,
             iterations,
         } => commands::benchmark(cpp_source, rust_source, input, iterations),
-        Commands::Migrate { input, output } => commands::migrate(input, output),
+        Commands::Migrate { input, output, full, use_ollama, cases, seed } => commands::migrate(input, output, full, use_ollama, cases, seed),
         Commands::Models { command } => match command {
             ModelCommands::List => commands::models_list(),
             ModelCommands::Validate => commands::models_validate(),
