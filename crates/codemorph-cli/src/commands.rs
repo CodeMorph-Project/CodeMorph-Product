@@ -312,8 +312,45 @@ fn deterministic_translation(source: &str) -> Option<String> {
     }
 }
 
-pub fn migrate(input: PathBuf, output: PathBuf, full: bool, use_ollama: bool, cases: usize, seed: u64) {
-    let allow_ollama = use_ollama || std::env::var("CODEMORPH_USE_OLLAMA").map(|v| v=="1").unwrap_or(false);
+pub fn migrate(input: PathBuf, output: PathBuf, stage: String, full: bool, use_ollama: bool, cases: usize, seed: u64) {
+    let allow_ollama = use_ollama || std::env::var("CODEMORPH_USE_OLLAMA").map(|v| v == "1").unwrap_or(false);
+
+    std::fs::create_dir_all(&output).ok();
+    let codemorph_dir = output.join(".codemorph");
+    let stage_dir = codemorph_dir.join("stages");
+    std::fs::create_dir_all(&stage_dir).ok();
+
+    match stage.as_str() {
+        "analyze" => {
+            let ir = codemorph_project::analyze(&input);
+            let path = codemorph_dir.join("project_ir.json");
+            let _ = std::fs::write(&path, serde_json::to_string_pretty(&ir).unwrap_or_default());
+            println!("analyzed files: {}", ir.files.len());
+            println!("artifact: {}", path.display());
+            println!("status: analyze complete");
+            return;
+        }
+        "translate" => {
+            println!("translate stage (artifact only)");
+            let path = stage_dir.join("translate.json");
+            std::fs::create_dir_all(&stage_dir).ok();
+            let _ = std::fs::write(&path, "[]");
+            println!("artifact: {}", path.display());
+            return;
+        }
+        "repair" => {
+            let path = stage_dir.join("repair.json");
+            std::fs::create_dir_all(&stage_dir).ok();
+            let _ = std::fs::write(&path, "[]");
+            println!("repair artifact: {}", path.display());
+            return;
+        }
+        "verify" => {
+            println!("verify stage: run main behavioral verification");
+            return;
+        }
+        _ => {}
+    }
 
     println!("Analyzing {}", input.display());
     if !input.exists() {
@@ -685,6 +722,7 @@ fn behavior_check(cpp_source: &str, rust_source: &str, cases: usize, seed: u64) 
     }
     (passed == cases.max(1) as u64 && cases > 0, passed)
 }
+
 
 
 
