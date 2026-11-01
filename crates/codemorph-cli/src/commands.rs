@@ -313,6 +313,52 @@ fn deterministic_translation(source: &str) -> Option<String> {
 }
 
 #[allow(clippy::too_many_arguments)]
+fn role_model_generate(role: &str, prompt: &str) -> Result<String, String> {
+    let models_root = std::env::var("CODEMORPH_MODELS_ROOT").unwrap_or_else(|_| "models".to_string());
+    let model_dir = std::path::PathBuf::from(models_root).join(role);
+    let manifest_path = model_dir.join("manifest.json");
+    if !manifest_path.exists() { return Err(format!("model missing for {}", role)); }
+    let manifest = std::fs::read_to_string(&manifest_path).unwrap_or_default();
+    if !manifest.contains("python-torch") { return Err(format!("unsupported backend for {}", role)); }
+    let python = std::env::var("CODEMORPH_PYTHON").unwrap_or_else(|_| "python3.12".to_string());
+    let mut pythonpath = std::env::var("CODEMORPH_PYTHONPATH").unwrap_or_else(|_| "python".to_string());
+    if !std::path::Path::new(&pythonpath).exists() { pythonpath = ".".to_string(); }
+    use codemorph_core::sandbox::{ExecutionLimits, ExecutionRequest};
+    use codemorph_sandbox::Sandbox;
+    let req = ExecutionRequest {
+        program: python.clone(),
+        args: vec!["-m".to_string(), "codemorph_ml.inference".to_string(), "--model-dir".to_string(), model_dir.display().to_string(), "--source-text".to_string(), prompt.to_string()],
+        cwd: None,
+        env: vec![("PYTHONPATH".to_string(), pythonpath)],
+        stdin: None,
+        limits: ExecutionLimits { timeout_ms: 120_000, ..Default::default() },
+    };
+    let res = Sandbox::execute(&req).map_err(|e| e.to_string())?;
+    if res.timed_out { return Err(format!("{} timeout", role)); }
+    if res.exit_code != Some(0) { return Err(res.stderr); }
+    if res.stdout.trim().is_empty() { return Err(format!("{} empty", role)); }
+    Ok(res.stdout)
+}
+
+fn collect_cpp_files(root: &PathBuf) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    fn walk(dir: &PathBuf, out: &mut Vec<PathBuf>) {
+        if let Ok(read) = std::fs::read_dir(dir) {
+            for entry in read.flatten() {
+                let p = entry.path();
+                if p.is_dir() { walk(&p, out); }
+                else if let Some(ext)=p.extension().and_then(|x|x.to_str()) {
+                    if matches!(ext, "cpp"|"cc"|"cxx"|"c"|"h"|"hpp") { out.push(p); }
+                }
+            }
+        }
+    }
+    walk(root, &mut out);
+    out.sort();
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn migrate(input: PathBuf, output: PathBuf, stage: String, full: bool, use_ollama: bool, cases: usize, seed: u64, include_stages: Option<String>, skip_stages: Option<String>) {
     let _ = include_stages;
     let _ = skip_stages;
@@ -359,7 +405,7 @@ pub fn migrate(input: PathBuf, output: PathBuf, stage: String, full: bool, use_o
                 let source_cpp = std::fs::read_to_string(source_path).unwrap_or_default();
                 let candidate = deterministic_translation(&source_cpp).or_else(|| {
                     generate_translation(&build_translation_prompt(&source_cpp), true, true).ok().map(|x| clean_text(&x))
-                }).unwrap_or_else(|| String::new());
+                }).unwrap_or_default();
                 let _ = std::fs::write(&out_path, &candidate);
                 let status = if write_and_check_rust(&out_path, &candidate) { "compiled" } else { "failed" };
                 summary.push(serde_json::json!({
@@ -392,8 +438,63 @@ pub fn migrate(input: PathBuf, output: PathBuf, stage: String, full: bool, use_o
             println!("artifact: {}", path.display());
             return;
         }
+        "ownership" => {
+            let mut reports = Vec::new();
+            for source_path in collect_cpp_files(&input) {
+                let source = std::fs::read_to_string(&source_path).unwrap_or_default();
+                if source.trim().is_empty() { continue; }
+                match role_model_generate("ownership", &format!("Classify ownership recommendation.\n{}", source)) {
+                    Ok(resp) => reports.push(serde_json::json!({ "file": source_path.display().to_string(), "status": "model-checked", "note": clean_text(&resp) })),
+                    Err(e) => reports.push(serde_json::json!({ "file": source_path.display().to_string(), "status": e })),
+                }
+            }
+            let path = stage_dir.join("ownership.json");
+            let _ = std::fs::write(&path, serde_json::to_string_pretty(&reports).unwrap_or_default());
+            println!("ownership stage: {} files, artifact {}", reports.len(), path.display());
+            return;
+        }
+        "idiomatize" => {
+            let mut reports = Vec::new();
+            for rust_path in collect_rust_files(&output) {
+                let source = std::fs::read_to_string(&rust_path).unwrap_or_default();
+                if source.trim().is_empty() { continue; }
+                match role_model_generate("idiomatizer", &format!("Rewrite Rust more idiomatically while preserving behavior. Return code only.\n{}", source)) {
+                    Ok(candidate) => {
+                        let candidate = clean_text(&candidate);
+                        let ok = write_and_check_rust(&rust_path.with_extension("idiom.rs"), &candidate);
+                        reports.push(serde_json::json!({ "file": rust_path.display().to_string(), "status": if ok { "candidate valid" } else { "candidate invalid" } }));
+                    }
+                    Err(e) => reports.push(serde_json::json!({ "file": rust_path.display().to_string(), "status": e })),
+                }
+            }
+            let path = stage_dir.join("idiomatize.json");
+            let _ = std::fs::write(&path, serde_json::to_string_pretty(&reports).unwrap_or_default());
+            println!("idiomatize stage: {} files, artifact {}", reports.len(), path.display());
+            return;
+        }
         "verify" => {
-            println!("verify stage: run main behavioral verification");
+            let manifest_path = output.join(".codemorph").join("migration-report.json");
+            if let Ok(text)=std::fs::read_to_string(&manifest_path) {
+                if let Ok(jsonv)=serde_json::from_str::<serde_json::Value>(&text) {
+                    if let Some(files)=jsonv.get("files").and_then(|v|v.as_array()) {
+                        let mut ok=0;
+                        for f in files {
+                            let src = f.get("source").and_then(|v|v.as_str()).map(PathBuf::from);
+                            let out = f.get("output").and_then(|v|v.as_str()).map(PathBuf::from);
+                            if let (Some(src),Some(outp))=(src,out) {
+                                let source_cpp=std::fs::read_to_string(&src).unwrap_or_default();
+                                let generated=std::fs::read_to_string(&outp).unwrap_or_default();
+                                let (pass, _count)=behavior_check(&source_cpp,&generated,cases,seed);
+                                println!("  {} -> {}", src.display(), if pass {"OK"} else {"MISMATCH"});
+                                if pass { ok+=1; }
+                            }
+                        }
+                        println!("verified: {}/{}", ok, files.len());
+                    }
+                }
+            } else {
+                eprintln!("Run migrate --stage all or translate first to produce migration-report.json");
+            }
             return;
         }
         _ => {}
