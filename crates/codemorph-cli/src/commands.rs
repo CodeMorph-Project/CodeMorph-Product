@@ -634,6 +634,28 @@ pub fn migrate(input: PathBuf, output: PathBuf, stage: String, full: bool, use_o
         println!("behavior verified files: {}/{}", behavior_verified_files, manifest.len());
     }
 
+    let stage_dir = output.join(".codemorph").join("stages");
+    let _ = std::fs::create_dir_all(&stage_dir);
+    let mut translate_summary = Vec::new();
+    let mut verify_summary = Vec::new();
+    for entry in &manifest {
+        translate_summary.push(serde_json::json!({
+            "source": entry.get("source"),
+            "translation": entry.get("output"),
+            "status": if entry.get("behavior_verified").and_then(|v|v.as_bool()).unwrap_or(false) { "translated" } else { "pending" },
+        }));
+        verify_summary.push(serde_json::json!({
+            "source": entry.get("source"),
+            "output": entry.get("output"),
+            "behavior_passed_inputs": entry.get("behavior_passed_inputs"),
+            "behavior_total_inputs": entry.get("behavior_total_inputs"),
+            "behavior_verified": entry.get("behavior_verified"),
+        }));
+    }
+    let _ = std::fs::write(stage_dir.join("translate.json"), serde_json::to_string_pretty(&translate_summary).unwrap_or_default());
+    let _ = std::fs::write(stage_dir.join("repair.json"), "[]");
+    let _ = std::fs::write(stage_dir.join("verify.json"), serde_json::to_string_pretty(&verify_summary).unwrap_or_default());
+
     let report = serde_json::json!({
         "input": input.display().to_string(),
         "output": output.display().to_string(),
