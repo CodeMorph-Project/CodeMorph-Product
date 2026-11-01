@@ -312,7 +312,11 @@ fn deterministic_translation(source: &str) -> Option<String> {
     }
 }
 
-pub fn migrate(input: PathBuf, output: PathBuf, stage: String, full: bool, use_ollama: bool, cases: usize, seed: u64) {
+#[allow(clippy::too_many_arguments)]
+pub fn migrate(input: PathBuf, output: PathBuf, stage: String, full: bool, use_ollama: bool, cases: usize, seed: u64, include_stages: Option<String>, skip_stages: Option<String>) {
+    let _ = include_stages;
+    let _ = skip_stages;
+
     let allow_ollama = use_ollama || std::env::var("CODEMORPH_USE_OLLAMA").map(|v| v == "1").unwrap_or(false);
 
     std::fs::create_dir_all(&output).ok();

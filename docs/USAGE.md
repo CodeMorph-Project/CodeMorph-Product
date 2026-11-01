@@ -36,3 +36,17 @@ codemorph benchmark --cpp-source '...' --rust-source '...' --iterations 20
 ```sh
 codemorph models validate
 ```
+
+## Stage controls
+
+```sh
+codemorph migrate ./cpp --output ./rust --stage translate
+codemorph migrate ./cpp --output ./rust --stage repair
+codemorph migrate ./cpp --output ./rust --stage verify
+codemorph migrate ./cpp --output ./rust --stage all --full
+```
+
+```sh
+codemorph migrate ./cpp --output ./rust --full --include-stages translate,repair,verify
+codemorph migrate ./cpp --output ./rust --full --skip-stages idiomatize,performance
+```
