@@ -270,48 +270,25 @@ fn resolve_pythonpath() -> String {
 
 
 fn deterministic_translation(source: &str) -> Option<String> {
-    if !source.contains("int main") {
-        return None;
-    }
+    if !source.contains("int main") { return None; }
+
     let mut out = String::new();
     for line in source.lines() {
         let line = line.trim();
         if line.starts_with("#include") { continue; }
         if line == "using namespace std;" { continue; }
         out.push_str(line);
-        out.push('\n');
+        out.push(' ');
     }
-    while let Some(start) = out.find("std::cout << ") {
-        let prefix = out[..start].to_string();
-        let rest = &out[start..];
-        if let Some(end) = rest.find(';') {
-            let mut expr = rest["std::cout << ".len()..end].trim().to_string();
-            let mut newline = false;
-            if let Some(pos) = expr.rfind(r#" << "\n""#) {
-                newline = true;
-                expr = expr[..pos].trim().to_string();
-            }
-            if let Some(pos) = expr.rfind(r#" << "\n""#) {
-                newline = true;
-                expr = expr[..pos].trim().to_string();
-            }
-            if expr.starts_with('"') && expr.ends_with('"') && (expr.contains("\\n") || expr.contains("\\t")) {
-            // trailing newline already handled above if marker present
-            }
-            let remain = &rest[end + 1..];
-            let stmt = if newline {
-                format!("println!(\"{{}}\", {});", expr)
-            } else {
-                format!("print!(\"{{}}\", {});", expr)
-            };
-            out = format!("{}{}{}", prefix, stmt, remain);
-        } else {
-            break;
-        }
-    }
+
     out = out.replace("int main(){", "fn main() {");
     out = out.replace("int main() {", "fn main() {");
+    out = out.replace("std::cout << ", r#"println!("{}", "#);
+    out = out.replace(" << std::endl;", ");");
+    out = out.replace(" << \"\\n\";", ");");
+    out = out.replace("std::endl", "");
     out = out.replace("return 0;", "");
+
     if out.contains("fn main") {
         if !out.trim_end().ends_with('}') {
             out.push('}');
@@ -322,53 +299,6 @@ fn deterministic_translation(source: &str) -> Option<String> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn role_model_generate(role: &str, prompt: &str) -> Result<String, String> {
-    let models_root = std::env::var("CODEMORPH_MODELS_ROOT").unwrap_or_else(|_| "models".to_string());
-    let model_dir = std::path::PathBuf::from(models_root).join(role);
-    let manifest_path = model_dir.join("manifest.json");
-    if !manifest_path.exists() { return Err(format!("model missing for {}", role)); }
-    let manifest = std::fs::read_to_string(&manifest_path).unwrap_or_default();
-    if !manifest.contains("python-torch") { return Err(format!("unsupported backend for {}", role)); }
-    let python = std::env::var("CODEMORPH_PYTHON").unwrap_or_else(|_| "python3.12".to_string());
-    let mut pythonpath = std::env::var("CODEMORPH_PYTHONPATH").unwrap_or_else(|_| "python".to_string());
-    if !std::path::Path::new(&pythonpath).exists() { pythonpath = ".".to_string(); }
-    use codemorph_core::sandbox::{ExecutionLimits, ExecutionRequest};
-    use codemorph_sandbox::Sandbox;
-    let req = ExecutionRequest {
-        program: python.clone(),
-        args: vec!["-m".to_string(), "codemorph_ml.inference".to_string(), "--model-dir".to_string(), model_dir.display().to_string(), "--source-text".to_string(), prompt.to_string()],
-        cwd: None,
-        env: vec![("PYTHONPATH".to_string(), pythonpath)],
-        stdin: None,
-        limits: ExecutionLimits { timeout_ms: 120_000, ..Default::default() },
-    };
-    let res = Sandbox::execute(&req).map_err(|e| e.to_string())?;
-    if res.timed_out { return Err(format!("{} timeout", role)); }
-    if res.exit_code != Some(0) { return Err(res.stderr); }
-    if res.stdout.trim().is_empty() { return Err(format!("{} empty", role)); }
-    Ok(res.stdout)
-}
-
-fn collect_cpp_files(root: &PathBuf) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    fn walk(dir: &PathBuf, out: &mut Vec<PathBuf>) {
-        if let Ok(read) = std::fs::read_dir(dir) {
-            for entry in read.flatten() {
-                let p = entry.path();
-                if p.is_dir() { walk(&p, out); }
-                else if let Some(ext)=p.extension().and_then(|x|x.to_str()) {
-                    if matches!(ext, "cpp"|"cc"|"cxx"|"c"|"h"|"hpp") { out.push(p); }
-                }
-            }
-        }
-    }
-    walk(root, &mut out);
-    out.sort();
-    out
-}
-
-#[allow(clippy::too_many_arguments)]
 pub fn migrate(input: PathBuf, output: PathBuf, stage: String, full: bool, use_ollama: bool, cases: usize, seed: u64, include_stages: Option<String>, skip_stages: Option<String>) {
     let _ = include_stages;
     let _ = skip_stages;
@@ -921,4 +851,49 @@ fn collect_rust_files(root: &std::path::PathBuf) -> Vec<std::path::PathBuf> {
     walk(root, &mut out);
     out.sort();
     out
+}
+
+fn collect_cpp_files(root: &PathBuf) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    fn walk(dir: &PathBuf, out: &mut Vec<PathBuf>) {
+        if let Ok(read) = std::fs::read_dir(dir) {
+            for entry in read.flatten() {
+                let p = entry.path();
+                if p.is_dir() { walk(&p, out); }
+                else if let Some(ext)=p.extension().and_then(|x|x.to_str()) {
+                    if matches!(ext, "cpp"|"cc"|"cxx"|"c"|"h"|"hpp") { out.push(p); }
+                }
+            }
+        }
+    }
+    walk(root, &mut out);
+    out.sort();
+    out
+}
+
+fn role_model_generate(role: &str, prompt: &str) -> Result<String, String> {
+    let models_root = std::env::var("CODEMORPH_MODELS_ROOT").unwrap_or_else(|_| "models".to_string());
+    let model_dir = PathBuf::from(models_root).join(role);
+    let manifest_path = model_dir.join("manifest.json");
+    if !manifest_path.exists() { return Err(format!("model missing for {}", role)); }
+    let manifest = std::fs::read_to_string(&manifest_path).unwrap_or_default();
+    if !manifest.contains("python-torch") { return Err(format!("unsupported backend for {}", role)); }
+    let python = std::env::var("CODEMORPH_PYTHON").unwrap_or_else(|_| "python3.12".to_string());
+    let mut pythonpath = std::env::var("CODEMORPH_PYTHONPATH").unwrap_or_else(|_| "python".to_string());
+    if !std::path::Path::new(&pythonpath).exists() { pythonpath = ".".to_string(); }
+    use codemorph_core::sandbox::{ExecutionLimits, ExecutionRequest};
+    use codemorph_sandbox::Sandbox;
+    let req = ExecutionRequest {
+        program: python.clone(),
+        args: vec!["-m".to_string(), "codemorph_ml.inference".to_string(), "--model-dir".to_string(), model_dir.display().to_string(), "--source-text".to_string(), prompt.to_string()],
+        cwd: None,
+        env: vec![("PYTHONPATH".to_string(), pythonpath)],
+        stdin: None,
+        limits: ExecutionLimits { timeout_ms: 120_000, ..Default::default() },
+    };
+    let res = Sandbox::execute(&req).map_err(|e| e.to_string())?;
+    if res.timed_out { return Err(format!("{} timeout", role)); }
+    if res.exit_code != Some(0) { return Err(res.stderr); }
+    if res.stdout.trim().is_empty() { return Err(format!("{} empty", role)); }
+    Ok(res.stdout)
 }
