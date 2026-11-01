@@ -8,9 +8,15 @@ PYTHON_DIR="${CODEMORPH_PYTHON:-/opt/homebrew/bin/python3.12}"
 echo "CodeMorph bootstrap"
 mkdir -p "$BIN_DIR"
 
+if [ -x "$HOME/.rustup/toolchains/nightly-aarch64-apple-darwin/bin/cargo" ]; then
+  export PATH="$HOME/.rustup/toolchains/nightly-aarch64-apple-darwin/bin:$PATH"
+fi
+if [ -x "$HOME/.cargo/bin/cargo" ]; then
+  export PATH="$HOME/.cargo/bin:$PATH"
+fi
 if command -v cargo >/dev/null 2>&1 && command -v rustc >/dev/null 2>&1; then
   echo "Cargo available; installing with cargo install --path crates/codemorph-cli"
-  cargo install --manifest-path "$ROOT/Cargo.toml" --path "$ROOT/crates/codemorph-cli" --locked
+  cargo install --path "$ROOT/crates/codemorph-cli" --locked --root "$HOME/.cargo"
 else
   echo "Cargo missing; falling back to an existing binary"
   if [ -x "$ROOT/target/release/codemorph" ]; then
@@ -31,11 +37,11 @@ if ! echo "$PATH" | tr ':' '\n' | grep -qx "$BIN_DIR"; then
   echo ""
 fi
 
-export PATH="$BIN_DIR:$PATH"
+export PATH="$BIN_DIR:$HOME/.cargo/bin:$PATH"
 export CODEMORPH_PYTHON="$PYTHON_DIR"
 
 echo "Verifying:"
-"$BIN_DIR/codemorph" check
+command -v codemorph && codemorph check
 "$BIN_DIR/codemorph" models validate || true
 
 echo ""
