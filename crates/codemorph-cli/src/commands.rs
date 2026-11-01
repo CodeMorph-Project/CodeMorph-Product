@@ -335,18 +335,61 @@ pub fn migrate(input: PathBuf, output: PathBuf, stage: String, full: bool, use_o
             return;
         }
         "translate" => {
-            println!("translate stage (artifact only)");
+            if !input.exists() { eprintln!("input does not exist"); return; }
+            let mut source_files = Vec::new();
+            if input.is_file() { source_files.push(input.clone()); } else {
+                fn walk(dir: &PathBuf, out: &mut Vec<PathBuf>) {
+                    if let Ok(read) = std::fs::read_dir(dir) {
+                        for entry in read.flatten() {
+                            let p = entry.path();
+                            if p.is_dir() { walk(&p, out); }
+                            else if let Some(ext)=p.extension().and_then(|x|x.to_str()) {
+                                if matches!(ext, "cpp"|"cc"|"cxx"|"c"|"h"|"hpp") { out.push(p); }
+                            }
+                        }
+                    }
+                }
+                walk(&input,&mut source_files);
+            }
+            let mut summary = Vec::new();
+            for source_path in &source_files {
+                let rel = if input.is_dir() { source_path.strip_prefix(&input).unwrap_or(source_path).to_path_buf() } else { source_path.file_name().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("input.rs")) };
+                let out_path = output.join(rel.with_extension("rs"));
+                if let Some(p)=out_path.parent(){std::fs::create_dir_all(p).ok();}
+                let source_cpp = std::fs::read_to_string(source_path).unwrap_or_default();
+                let candidate = deterministic_translation(&source_cpp).or_else(|| {
+                    generate_translation(&build_translation_prompt(&source_cpp), true, true).ok().map(|x| clean_text(&x))
+                }).unwrap_or_else(|| String::new());
+                let _ = std::fs::write(&out_path, &candidate);
+                let status = if write_and_check_rust(&out_path, &candidate) { "compiled" } else { "failed" };
+                summary.push(serde_json::json!({
+                    "source": source_path.display().to_string(),
+                    "output": out_path.display().to_string(),
+                    "status": status
+                }));
+            }
             let path = stage_dir.join("translate.json");
-            std::fs::create_dir_all(&stage_dir).ok();
-            let _ = std::fs::write(&path, "[]");
+            let _ = std::fs::write(&path, serde_json::to_string_pretty(&summary).unwrap_or_default());
+            println!("translated artifacts: {}", summary.len());
             println!("artifact: {}", path.display());
+            println!("status: translate complete");
             return;
         }
         "repair" => {
+            let mut results = Vec::new();
+            for rust_path in &collect_rust_files(&output) {
+                let source = std::fs::read_to_string(rust_path).unwrap_or_default();
+                let compiled = write_and_check_rust(rust_path, &source);
+                if compiled {
+                    results.push(serde_json::json!({ "file": rust_path.display().to_string(), "compiled": true, "status": "already valid" }));
+                } else {
+                    results.push(serde_json::json!({ "file": rust_path.display().to_string(), "compiled": false, "status": "needs repair" }));
+                }
+            }
             let path = stage_dir.join("repair.json");
-            std::fs::create_dir_all(&stage_dir).ok();
-            let _ = std::fs::write(&path, "[]");
-            println!("repair artifact: {}", path.display());
+            let _ = std::fs::write(&path, serde_json::to_string_pretty(&results).unwrap_or_default());
+            println!("repair stage complete: {} files scanned", results.len());
+            println!("artifact: {}", path.display());
             return;
         }
         "verify" => {
@@ -730,3 +773,19 @@ fn behavior_check(cpp_source: &str, rust_source: &str, cases: usize, seed: u64) 
 
 
 
+
+fn collect_rust_files(root: &std::path::PathBuf) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    fn walk(dir: &std::path::PathBuf, out: &mut Vec<std::path::PathBuf>) {
+        if let Ok(read) = std::fs::read_dir(dir) {
+            for entry in read.flatten() {
+                let p = entry.path();
+                if p.is_dir() { walk(&p, out); }
+                else if p.extension().and_then(|x|x.to_str()) == Some("rs") { out.push(p); }
+            }
+        }
+    }
+    walk(root, &mut out);
+    out.sort();
+    out
+}
