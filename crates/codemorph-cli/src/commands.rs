@@ -903,12 +903,3 @@ fn role_model_generate(role: &str, prompt: &str) -> Result<String, String> {
 }
 
 
-#[cfg(test)]
-mod debug_cout_final {
-    use super::*;
-    #[test]
-    fn d() {
-        let src = "#include <iostream>\nint main(){std::cout << \"hi\\n\"; return 0;}";
-        println!("OUT={:?}", deterministic_translation(src));
-    }
-}
