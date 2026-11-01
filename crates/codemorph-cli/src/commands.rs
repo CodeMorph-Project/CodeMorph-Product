@@ -269,26 +269,29 @@ fn resolve_pythonpath() -> String {
 }
 
 
-fn deterministic_translation(source: &str) -> Option<String> {
-    if !source.contains("int main") { return None; }
 
+fn deterministic_translation(source: &str) -> Option<String> {
+    if !source.contains("int main") {
+        return None;
+    }
     let mut out = String::new();
+    // Basic preprocessing: drop common C++ includes.
     for line in source.lines() {
         let line = line.trim();
         if line.starts_with("#include") { continue; }
         if line == "using namespace std;" { continue; }
         out.push_str(line);
-        out.push(' ');
+        out.push('\n');
     }
-
+    // Minimal syntactic conversions.
     out = out.replace("int main(){", "fn main() {");
     out = out.replace("int main() {", "fn main() {");
     out = out.replace("std::cout << ", r#"println!("{}", "#);
     out = out.replace(" << std::endl;", ");");
     out = out.replace(" << \"\\n\";", ");");
-    out = out.replace("std::endl", "");
+    out = out.replace("std::cout << ", r#"println!("{}", "#);
+    // A trailing bare return 0 is removed for Rust main unit.
     out = out.replace("return 0;", "");
-
     if out.contains("fn main") {
         if !out.trim_end().ends_with('}') {
             out.push('}');
@@ -299,7 +302,6 @@ fn deterministic_translation(source: &str) -> Option<String> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn migrate(input: PathBuf, output: PathBuf, stage: String, full: bool, use_ollama: bool, cases: usize, seed: u64, include_stages: Option<String>, skip_stages: Option<String>) {
     let _ = include_stages;
     let _ = skip_stages;
@@ -897,4 +899,15 @@ fn role_model_generate(role: &str, prompt: &str) -> Result<String, String> {
     if res.exit_code != Some(0) { return Err(res.stderr); }
     if res.stdout.trim().is_empty() { return Err(format!("{} empty", role)); }
     Ok(res.stdout)
+}
+
+
+#[cfg(test)]
+mod debug_cout_final {
+    use super::*;
+    #[test]
+    fn d() {
+        let src = "#include <iostream>\nint main(){std::cout << \"hi\\n\"; return 0;}";
+        println!("OUT={:?}", deterministic_translation(src));
+    }
 }
