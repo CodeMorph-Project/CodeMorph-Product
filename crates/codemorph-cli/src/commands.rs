@@ -223,6 +223,11 @@ fn resolve_models_root() -> String {
     if let Ok(value) = std::env::var("CODEMORPH_MODELS_ROOT") {
         if !value.trim().is_empty() { return value; }
     }
+    // Prefer the per-user global registry for installed binaries.
+    let home_candidate = format!("{}/.codemorph/models", std::env::var("HOME").unwrap_or_default());
+    if std::path::PathBuf::from(&home_candidate).join("translator").join("manifest.json").exists() {
+        return home_candidate;
+    }
     let cwd = std::path::PathBuf::from("models");
     if cwd.join("translator").join("manifest.json").exists() {
         return cwd.display().to_string();
@@ -234,6 +239,11 @@ fn resolve_models_root() -> String {
                 return candidate.display().to_string();
             }
         }
+    }
+    // Installed/global single-user model location.
+    let home_candidate = format!("{}/.codemorph/models", std::env::var("HOME").unwrap_or_default());
+    if std::path::PathBuf::from(&home_candidate).join("translator").join("manifest.json").exists() {
+        return home_candidate;
     }
     "models".to_string()
 }
@@ -679,7 +689,7 @@ pub fn migrate(input: PathBuf, output: PathBuf, stage: String, full: bool, use_o
 }
 
 pub fn models_list() {
-    let root = std::env::var("CODEMORPH_MODELS").unwrap_or_else(|_| "models".to_string());
+    let root = resolve_models_root();
     let reg = codemorph_models::ModelRegistry::new(PathBuf::from(&root));
     let manifests = reg.discover();
     if manifests.is_empty() {
@@ -692,7 +702,7 @@ pub fn models_list() {
 }
 
 pub fn models_validate() {
-    let root = std::env::var("CODEMORPH_MODELS").unwrap_or_else(|_| "models".to_string());
+    let root = resolve_models_root();
     let reg = codemorph_models::ModelRegistry::new(PathBuf::from(&root));
     let results = reg.validate_all();
     if results.is_empty() {
