@@ -88,3 +88,11 @@ report is written to:
 ```text
 rust-project/.codemorph/migration-report.json
 ```
+
+## Install from source
+
+```sh
+cd CodeMorph-Product
+cargo build --workspace --release
+./install.sh
+```
