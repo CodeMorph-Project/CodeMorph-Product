@@ -149,6 +149,17 @@ A translation is accepted only after at least compilation and deterministic test
 
 ## Git Workflow
 
+Release policy (mandatory):
+
+- `dev`: linear development branch. All features/fixes/docs land there.
+- `main`: release-only. Features are merged into main using a normal merge commit (`git merge --no-ff dev`), so the graph shows `dev` branching from a release and joining back into `main`.
+- One release commit on `main` per release: `release vX.Y.Z: ...`.
+- Every release gets tag `vX.Y.Z`.
+- Do not fast-forward `dev` into `main`.
+- Do not keep direct feature commits on `main`.
+- After release, switch back to `dev` and continue from there.
+
+
 - Work in small commits.
 - One logical change per commit.
 - Use Conventional Commits: `type(scope): description`.
