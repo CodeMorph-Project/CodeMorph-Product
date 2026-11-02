@@ -1,0 +1,5 @@
+[project]
+name = "codemorph-ml"
+version = "0.1.0"
+description = "CodeMorph Python machine learning utilities"
+requires-python = ">=3.11"

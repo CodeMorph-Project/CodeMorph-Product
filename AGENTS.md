@@ -139,6 +139,14 @@ A feature is done only when:
 
 A translation is accepted only after at least compilation and deterministic tests pass, and preferentially differential/property/fuzz checks. Behavioral disagreement must reject the candidate.
 
+## Branch And Release Policy
+
+- `dev` is the linear development branch.
+- `main` receives only release commits; no direct feature work.
+- Release commits are created from a `dev` squash/merge or curated snapshot.
+- Use tags for versions, for example `v0.1.0`.
+- Feature commits stay on `dev` until release.
+
 ## Git Workflow
 
 - Work in small commits.
