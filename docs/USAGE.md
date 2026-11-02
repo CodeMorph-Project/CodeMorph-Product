@@ -50,3 +50,5 @@ codemorph migrate ./cpp --output ./rust --stage all --full
 codemorph migrate ./cpp --output ./rust --full --include-stages translate,repair,verify
 codemorph migrate ./cpp --output ./rust --full --skip-stages idiomatize,performance
 ```
+
+Release merge must be --no-ff; squashing destroys visible graph links.
