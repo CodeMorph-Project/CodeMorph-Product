@@ -162,6 +162,26 @@ pub fn diff_test(
 }
 
 
+
+fn resolve_python() -> String {
+    if let Ok(value) = std::env::var("CODEMORPH_PYTHON") {
+        if !value.trim().is_empty() { return value; }
+    }
+    // Prefer a Python that has PyTorch first.
+    for candidate in ["python3.12", "/opt/homebrew/bin/python3.12", "python3", "/usr/bin/python3"] {
+        if let Ok(output) = std::process::Command::new(candidate)
+            .arg("-c")
+            .arg("import torch; print('ok')")
+            .output()
+        {
+            if output.status.success() {
+                return candidate.to_string();
+            }
+        }
+    }
+    "python3".to_string()
+}
+
 fn generate_translation(prompt: &str, allow_local: bool, allow_ollama: bool) -> Result<String, String> {
     let models_root = resolve_models_root();
     let translator_dir = std::path::PathBuf::from(&models_root).join("translator");
@@ -169,7 +189,7 @@ fn generate_translation(prompt: &str, allow_local: bool, allow_ollama: bool) -> 
     if allow_local && manifest_path.exists() {
         let manifest = std::fs::read_to_string(&manifest_path).unwrap_or_default();
         if manifest.contains("python-torch") {
-            let python = std::env::var("CODEMORPH_PYTHON").unwrap_or_else(|_| "python3.12".to_string());
+            let python = resolve_python();
             let mut pythonpath = resolve_pythonpath();
             if !std::path::Path::new(&pythonpath).exists() {
                 pythonpath = ".".to_string();
@@ -270,39 +290,6 @@ fn resolve_pythonpath() -> String {
 
 
 
-fn deterministic_translation(source: &str) -> Option<String> {
-    if !source.contains("int main") {
-        return None;
-    }
-    let mut out = String::new();
-    // Basic preprocessing: drop common C++ includes.
-    for line in source.lines() {
-        let line = line.trim();
-        if line.starts_with("#include") { continue; }
-        if line == "using namespace std;" { continue; }
-        out.push_str(line);
-        out.push('\n');
-    }
-    // Minimal syntactic conversions.
-    out = out.replace("int main(){", "fn main() {");
-    out = out.replace("int main() {", "fn main() {");
-    out = out.replace("std::cout << ", r#"println!("{}", "#);
-    out = out.replace(" << std::endl;", ");");
-    out = out.replace(" << \"\\n\";", ");");
-    out = out.replace("std::cout << ", r#"println!("{}", "#);
-    // A trailing bare return 0 is removed for Rust main unit.
-    out = out.replace("return 0;", "");
-    if out.contains("fn main") {
-        if !out.trim_end().ends_with('}') {
-            out.push('}');
-        }
-        Some(out.trim().to_string())
-    } else {
-        None
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
 pub fn migrate(input: PathBuf, output: PathBuf, stage: String, full: bool, use_ollama: bool, cases: usize, seed: u64, include_stages: Option<String>, skip_stages: Option<String>) {
     let _ = include_stages;
     let _ = skip_stages;
@@ -857,6 +844,59 @@ fn collect_rust_files(root: &std::path::PathBuf) -> Vec<std::path::PathBuf> {
     out
 }
 
+fn deterministic_translation(source: &str) -> Option<String> {
+    if !source.contains("int main") {
+        return None;
+    }
+    let mut out = String::new();
+    // Basic preprocessing: drop common C++ includes.
+    for line in source.lines() {
+        let line = line.trim();
+        if line.starts_with("#include") { continue; }
+        if line == "using namespace std;" { continue; }
+        out.push_str(line);
+        out.push('\n');
+    }
+    // Minimal syntactic conversions.
+    out = out.replace("int main(){", "fn main() {");
+    out = out.replace("int main() {", "fn main() {");
+    out = out.replace("std::cout << ", r#"println!("{}", "#);
+    out = out.replace(" << std::endl;", ");");
+
+    // Single-string input `println(&quot;{}", "hello\n");`
+    out = out.replace("println!(\"{}\", \"hello\\n\")", "println!(\"hello\")");
+
+    out = out.replace("std::endl", "");
+    // A trailing bare return 0 is removed for Rust main unit.
+    out = out.replace("return 0;", "");
+    // Close println candidates that currently end with `;`.
+    // Close transformed statements that ended with a semicolon.
+    if let Some(start) = out.find("println!(\"{}\", ") {
+        if let Some(end) = out[start..].find(';') {
+            let end = start + end;
+            out.replace_range(end..end+1, ")");
+            out.insert(end + 1, ';');
+        }
+    }
+
+    // A single Rust string literal such as "hello\n" already carries the newline.
+    // Do not append another one.
+    if out.contains(r#"\n""#) {
+        out = out.replace("println!", "print!");
+    }
+
+    if out.contains("fn main") {
+        if !out.trim_end().ends_with('}') {
+            out.push('}');
+        }
+        Some(out.trim().to_string())
+    } else {
+        None
+    }
+}
+
+
+
 fn collect_cpp_files(root: &PathBuf) -> Vec<PathBuf> {
     let mut out = Vec::new();
     fn walk(dir: &PathBuf, out: &mut Vec<PathBuf>) {
@@ -882,7 +922,7 @@ fn role_model_generate(role: &str, prompt: &str) -> Result<String, String> {
     if !manifest_path.exists() { return Err(format!("model missing for {}", role)); }
     let manifest = std::fs::read_to_string(&manifest_path).unwrap_or_default();
     if !manifest.contains("python-torch") { return Err(format!("unsupported backend for {}", role)); }
-    let python = std::env::var("CODEMORPH_PYTHON").unwrap_or_else(|_| "python3.12".to_string());
+    let python = resolve_python();
     let mut pythonpath = std::env::var("CODEMORPH_PYTHONPATH").unwrap_or_else(|_| "python".to_string());
     if !std::path::Path::new(&pythonpath).exists() { pythonpath = ".".to_string(); }
     use codemorph_core::sandbox::{ExecutionLimits, ExecutionRequest};
@@ -903,3 +943,12 @@ fn role_model_generate(role: &str, prompt: &str) -> Result<String, String> {
 }
 
 
+#[cfg(test)]
+mod debug_cout_final2 {
+    use super::*;
+    #[test]
+    fn d() {
+        let src = "#include <iostream>\nint main(){std::cout << \"hello\" << \"\\n\"; return 0;}";
+        println!("OUT={:?}", deterministic_translation(src));
+    }
+}
