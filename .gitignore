@@ -52,3 +52,5 @@ Thumbs.db
 *.key
 *.pem
 secrets/
+# Local private planning notes
+/notes/
