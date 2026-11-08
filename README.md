@@ -1,98 +1,129 @@
 # CodeMorph
 
-CodeMorph is an experimental platform for verified neural source-to-source program translation.
-
-C++ to Rust is the first supported translation direction. The architecture is intentionally generic so additional source/target languages can be added through adapters and translation-direction plugins without rewriting the core.
+CodeMorph is an experimental platform for **verified** source-to-source program
+translation. C++ to Rust is the first supported direction; the architecture is
+intentionally generic so further language pairs can be added through adapters
+and translation-direction plugins.
 
 ## Core principle
 
-- Neural networks propose candidates.
-- Compilers and verifiers decide correctness.
-- The orchestrator decides what to do next.
+- Deterministic analysis and translation are preferred over model generation.
+- Neural models only ever *propose* candidates.
+- Compilers and behavior tests decide correctness.
+- Nothing is reported as translated unless it compiles, and nothing is reported
+  as verified unless it also behaves like the original.
 
-CodeMorph separates deterministic analysis and verification from learned generation. Verifiers are mandatory, and translated Rust is never considered correct only because it compiles.
+A translation is never accepted merely because it compiles. The migration
+report distinguishes `verified` (compiles **and** matches behavior) from
+`compiled` (compiles, behavior not checked) from `unsupported` (outside the
+supported subset) from `failed` (attempted but rejected).
 
 ## Current status
 
-This repository is at an early implementation stage. Core abstractions, documentation, and the first C++/Rust vertical slices are being built. See `docs/roadmap.md`.
+The runtime product ships a **deterministic C++→Rust transpiler** for a
+conservative beginner subset (see below). It is the default translation path and
+requires no model, no network, and no Ollama.
+
+The neural translator in `models/translator/` is **experimental**: a small
+sequence-to-sequence model trained in the Lab. It is disabled by default and can
+only be used as an opt-in *proposer* (`CODEMORPH_USE_MODEL=1`); its output is
+still validated by the compiler and behavior checks before anything is accepted.
+It is not yet reliable enough to be a default, and this repository does not
+pretend otherwise.
+
+### Supported C++ subset (deterministic translator)
+
+- `#include` / `using namespace std;` / comments
+- `int main()` with `return 0;`
+- scalar declarations (`int`, `long`, `short`, `unsigned`, `size_t`, `double`,
+  `float`, `bool`, `char`) including comma declarations such as `int a, b;`
+- `std::string` values
+- `std::cin >> ...` chains (including `if (!(std::cin >> a >> b)) return 0;`)
+- `std::cout << ...` chains and `std::endl`
+- full expression precedence, ternary `?:`, prefix/postfix `++`/`--`
+- `if` / `else if` / `else`, `while`, `do-while`, C-style `for`, range `for`
+- simple `struct`s with methods and aggregate initialization
+- top-level free functions
+
+Anything outside this subset (templates, `class` with access specifiers,
+`unordered_map`/`map`/`vector`, `string_view`, `istringstream`, `unique_ptr`,
+`variant`, lambdas, `operator new`, `reinterpret_cast`, concepts, …) is reported
+as `unsupported` with the first offending construct named. No partial or
+garbage Rust is emitted for unsupported input.
 
 ## Quick start
 
-Requirements for the current C++ to Rust slice:
-
-- Rust toolchain (`cargo`, `rustc`)
-- C/C++ toolchain (`clang`, `clang++`)
-- Python 3.11 or newer
-
-Build:
+Requirements: Rust toolchain (`cargo`, `rustc`), a C/C++ compiler (`g++` or
+`clang++`).
 
 ```sh
 cargo build --workspace
 ```
 
-Run tests:
+Migrate a directory of C++ files:
 
 ```sh
-cargo test --workspace
-python3 -m pytest python/tests 2>/dev/null || true
+./target/debug/codemorph migrate ./cpp --output ./rust --full
 ```
 
-CLI (planned):
+`--full` enables behavior verification (compiles the original C++ and the
+generated Rust and compares stdout over seeded inputs). Without `--full`, files
+are only compile-checked and reported as `compiled`.
 
-```sh
-migrate ./cpp-project --output ./rust-project
+The report is written to:
+
+```text
+rust/.codemorph/migration-report.json
 ```
+
+Example summary:
+
+```text
+verified: 8
+compiled: 0
+unsupported: 4
+failed: 0
+total: 12
+```
+
+### Environment variables
+
+| Variable | Meaning |
+|---|---|
+| `CODEMORPH_MODELS_ROOT` | Directory containing `models/<role>/manifest.json` |
+| `CODEMORPH_PYTHONPATH` | Python package path for the optional model backend |
+| `CODEMORPH_PYTHON` | Python interpreter used for the optional model backend |
+| `CODEMORPH_USE_MODEL=1` | Enable the experimental neural proposer for unsupported files |
+| `CODEMORPH_USE_OLLAMA=1` | Enable the Ollama teacher (Lab/training only; never required for migration) |
 
 ## Repository layout
 
 - `crates/`: Rust core, adapters, CLI, verification, sandbox
-- `python/`: machine learning, tokenizers, training
-- `docs/`: architecture, roadmap, decisions
-- `configs/`: datasets, models, training, evaluation
+- `python/`: model runtime, tokenizers, inference
+- `docs/`: architecture, usage, roadmap, decisions
 - `fixtures/`: small reproducible test projects
-- `experiments/`: experiment definitions
+- `models/`: installed model registry (weights are never committed)
 
-## License
+## Tests
 
-See `LICENSE` once published.>
+```sh
+cargo fmt --check
+cargo clippy --workspace -- -D warnings
+cargo test --workspace
+python3 -m pytest python/tests
+```
 
 ## Model artifacts
 
-CodeMorph resolves models through a local registry:
-
-```text
-models/<role>/manifest.json
-```
-
-Models are not trained in product runtime. They are installed from a
-CodeMorph Lab release bundle with `tools/install_models.py`.
-
-## Quick start
-
-Install a translator model into the runtime registry:
+Models are not trained in the product runtime. They are installed from a Lab
+release bundle:
 
 ```sh
-export CODEMORPH_OLLAMA_MODEL=beam:cloud
+python scripts/install_models.py --model-dir <artifact> --to models --role-name translator
 ```
 
-Run migration:
+See `docs/models.md` and `docs/inference.md` for the registry contract.
 
-```sh
-codemorph migrate ./cpp-project --output ./rust-project
-```
+## License
 
-Each supported source file is translated with Ollama, checked with
-`rustc`, and optionally repaired once using compiler diagnostics. The final
-report is written to:
-
-```text
-rust-project/.codemorph/migration-report.json
-```
-
-## Install from source
-
-```sh
-cd CodeMorph-Product
-cargo build --workspace --release
-./install.sh
-```
+Apache-2.0.
