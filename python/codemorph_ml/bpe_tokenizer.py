@@ -17,7 +17,7 @@ class BpeTokenizer:
     id_to_token: dict[int, str]
 
     @classmethod
-    def train(cls, texts: List[str], vocab_size: int = 4096, num_merges: int = 2000):
+    def train(cls, texts: List[str], vocab_size: int = 4096, num_merges: int = 120):
         word_split = []
         for text in texts:
             word_split.extend(PRETOKENIZER_RE.findall(text))

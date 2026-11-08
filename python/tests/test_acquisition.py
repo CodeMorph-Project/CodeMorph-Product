@@ -20,5 +20,3 @@ class TestAcquisition(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-EOF
-PYTHONPATH="$PWD/python" python3 -m unittest python/tests/test_acquisition.py 2>&1 | tail -5

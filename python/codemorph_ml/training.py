@@ -8,6 +8,7 @@ missing implementation as a trained model.
 from __future__ import annotations
 
 import dataclasses
+import os
 import json
 from dataclasses import dataclass, field
 from typing import Any, Dict, List
@@ -58,9 +59,9 @@ def _module_available(name: str) -> bool:
 
 
 def backend_availability() -> Dict[str, bool]:
-    import os
-
-    return {"mlx": _module_available("mlx"), "torch": _module_available("torch")}
+    # The generic ML package intentionally does not expose native training.
+    # Training is provided by scripts/train_role.py and scripts/full_training_pipeline.py.
+    return {"mlx": False, "torch": False}
 
 
 class TrainingBackendUnavailable(RuntimeError):

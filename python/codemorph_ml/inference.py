@@ -7,7 +7,7 @@ from pathlib import Path
 import torch
 
 from codemorph_ml.model_arch import SmallSeq2Seq
-from codemorph_ml.tokenizer_simple import SimpleCharTokenizer
+from codemorph_ml.bpe_tokenizer import BpeTokenizer
 
 
 SIZE_PARAMS = {
@@ -20,7 +20,7 @@ SIZE_PARAMS = {
 
 
 def load_artifact(model_dir: Path):
-    tokenizer = SimpleCharTokenizer.load(model_dir / "tokenizer.json")
+    tokenizer = BpeTokenizer.load(model_dir / "tokenizer.json")
     config = json.loads((model_dir / "model_config.json").read_text(encoding="utf-8"))
     params = {
         "vocab_size": len(tokenizer.token_to_id),
