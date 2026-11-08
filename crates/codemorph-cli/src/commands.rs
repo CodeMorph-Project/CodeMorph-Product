@@ -1,8 +1,9 @@
+use crate::translate::{self, TranslationOutcome};
 use codemorph_core::sandbox::{ExecutionLimits, ExecutionRequest};
 use codemorph_cpp::CppAdapter;
 use codemorph_rustlang::RustAdapter;
 use codemorph_sandbox::Sandbox;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub fn check() {
     println!("codemorph environment");
@@ -17,6 +18,130 @@ fn find(name: &str) -> &'static str {
         "available"
     } else {
         "missing"
+    }
+}
+
+#[derive(Debug, Clone)]
+enum FileStatus {
+    Verified,
+    Compiled,
+    Unsupported(String),
+    Failed(String),
+}
+
+impl FileStatus {
+    fn status_str(&self) -> &'static str {
+        match self {
+            FileStatus::Verified => "verified",
+            FileStatus::Compiled => "compiled",
+            FileStatus::Unsupported(_) => "unsupported",
+            FileStatus::Failed(_) => "failed",
+        }
+    }
+
+    fn reason(&self) -> Option<&str> {
+        match self {
+            FileStatus::Unsupported(r) | FileStatus::Failed(r) => Some(r.as_str()),
+            _ => None,
+        }
+    }
+}
+
+fn print_summary(
+    verified: usize,
+    compiled: usize,
+    unsupported: usize,
+    failed: usize,
+    total: usize,
+) {
+    println!("verified: {}", verified);
+    println!("compiled: {}", compiled);
+    println!("unsupported: {}", unsupported);
+    println!("failed: {}", failed);
+    println!("total: {}", total);
+}
+
+fn collect_source_files(input: &Path) -> Vec<PathBuf> {
+    if input.is_file() {
+        vec![input.to_path_buf()]
+    } else {
+        collect_cpp_files(&input.to_path_buf())
+    }
+}
+
+fn compile_rust_source(source: &str) -> Result<(), String> {
+    let result = RustAdapter::new().compile_text(source, None);
+    if result.success {
+        Ok(())
+    } else {
+        Err(result.stderr)
+    }
+}
+
+fn first_line(text: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Translate one C++ source file. The deterministic translator is authoritative;
+/// a neural model is only used as an opt-in proposer/repairer.
+fn translate_one(source_cpp: &str, out_path: &Path, allow_ollama: bool) -> FileStatus {
+    match translate::translate_cpp_to_rust(source_cpp) {
+        TranslationOutcome::Translated(rust) => {
+            if let Err(e) = std::fs::write(out_path, &rust) {
+                return FileStatus::Failed(format!("cannot write output: {}", e));
+            }
+            match compile_rust_source(&rust) {
+                Ok(()) => FileStatus::Compiled,
+                Err(err) => {
+                    if allow_ollama {
+                        let repair_prompt = format!(
+                            "You are repairing Rust code. Return ONLY complete valid Rust source, no markdown and no explanation. Original C++:\n```cpp\n{}\n```\nBroken Rust:\n```rust\n{}\n```",
+                            source_cpp, rust
+                        );
+                        if let Ok(repaired) =
+                            generate_translation(&repair_prompt, false, allow_ollama)
+                        {
+                            let repaired = clean_text(&repaired);
+                            if compile_rust_source(&repaired).is_ok()
+                                && std::fs::write(out_path, &repaired).is_ok()
+                            {
+                                return FileStatus::Compiled;
+                            }
+                        }
+                        FileStatus::Failed(format!(
+                            "rust compilation failed after repair: {}",
+                            first_line(&err)
+                        ))
+                    } else {
+                        FileStatus::Failed(format!("rust compilation failed: {}", first_line(&err)))
+                    }
+                }
+            }
+        }
+        TranslationOutcome::Unsupported(reason) => {
+            let use_model = std::env::var("CODEMORPH_USE_MODEL")
+                .map(|v| v == "1")
+                .unwrap_or(false);
+            if use_model {
+                if let Ok(candidate) =
+                    generate_translation(&build_translation_prompt(source_cpp), true, allow_ollama)
+                {
+                    let candidate = clean_text(&candidate);
+                    if compile_rust_source(&candidate).is_ok()
+                        && std::fs::write(out_path, &candidate).is_ok()
+                    {
+                        return FileStatus::Compiled;
+                    }
+                }
+            }
+            // Do not leave a stale or garbage .rs file for unsupported input.
+            let _ = std::fs::remove_file(out_path);
+            FileStatus::Unsupported(reason)
+        }
     }
 }
 
@@ -161,14 +286,19 @@ pub fn diff_test(
     }
 }
 
-
-
 fn resolve_python() -> String {
     if let Ok(value) = std::env::var("CODEMORPH_PYTHON") {
-        if !value.trim().is_empty() { return value; }
+        if !value.trim().is_empty() {
+            return value;
+        }
     }
     // Prefer a Python that has PyTorch first.
-    for candidate in ["python3.12", "/opt/homebrew/bin/python3.12", "python3", "/usr/bin/python3"] {
+    for candidate in [
+        "python3.12",
+        "/opt/homebrew/bin/python3.12",
+        "python3",
+        "/usr/bin/python3",
+    ] {
         if let Ok(output) = std::process::Command::new(candidate)
             .arg("-c")
             .arg("import torch; print('ok')")
@@ -182,7 +312,11 @@ fn resolve_python() -> String {
     "python3".to_string()
 }
 
-fn generate_translation(prompt: &str, allow_local: bool, allow_ollama: bool) -> Result<String, String> {
+fn generate_translation(
+    prompt: &str,
+    allow_local: bool,
+    allow_ollama: bool,
+) -> Result<String, String> {
     let models_root = resolve_models_root();
     let translator_dir = std::path::PathBuf::from(&models_root).join("translator");
     let manifest_path = translator_dir.join("manifest.json");
@@ -199,15 +333,30 @@ fn generate_translation(prompt: &str, allow_local: bool, allow_ollama: bool) -> 
             use codemorph_sandbox::Sandbox;
             let req = ExecutionRequest {
                 program: python.clone(),
-                args: vec!["-m".to_string(), "codemorph_ml.inference".to_string(), "--model-dir".to_string(), translator_dir.display().to_string(), "--source-text".to_string(), prompt.to_string()],
+                args: vec![
+                    "-m".to_string(),
+                    "codemorph_ml.inference".to_string(),
+                    "--model-dir".to_string(),
+                    translator_dir.display().to_string(),
+                    "--source-text".to_string(),
+                    prompt.to_string(),
+                ],
                 cwd: None,
                 env: env.clone(),
                 stdin: None,
-                limits: ExecutionLimits { timeout_ms: 300_000, ..Default::default() },
+                limits: ExecutionLimits {
+                    timeout_ms: 300_000,
+                    ..Default::default()
+                },
             };
             let res = Sandbox::execute(&req).map_err(|e| e.to_string())?;
-            if res.timed_out { return Err("python inference timeout".to_string()); }
-            if res.exit_code != Some(0) { return Err(res.stderr); }
+            if res.timed_out {
+                return Err("python inference timeout".to_string());
+            }
+            if res.exit_code != Some(0) {
+                eprintln!("python inference stderr: {}", res.stderr);
+                return Err(res.stderr);
+            }
             return Ok(res.stdout);
         }
     }
@@ -215,37 +364,58 @@ fn generate_translation(prompt: &str, allow_local: bool, allow_ollama: bool) -> 
     if !allow_ollama {
         return Err("Local model unavailable and Ollama assistance is disabled".to_string());
     }
-    let model = std::env::var("CODEMORPH_OLLAMA_MODEL").unwrap_or_else(|_| "beam:cloud".to_string());
+    let model =
+        std::env::var("CODEMORPH_OLLAMA_MODEL").unwrap_or_else(|_| "beam:cloud".to_string());
     python_ollama_generate(&model, prompt)
 }
 
-
 fn selected_translation_backend() -> String {
+    let use_model = std::env::var("CODEMORPH_USE_MODEL")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    if !use_model {
+        return "deterministic verified translator".to_string();
+    }
     let models_root = resolve_models_root();
-    let manifest_path = PathBuf::from(&models_root).join("translator").join("manifest.json");
+    let manifest_path = PathBuf::from(&models_root)
+        .join("translator")
+        .join("manifest.json");
     let local_disabled = std::env::var("CODEMORPH_USE_LOCAL_MODEL").unwrap_or_default() == "0";
     if !local_disabled && manifest_path.exists() {
         let manifest = std::fs::read_to_string(&manifest_path).unwrap_or_default();
         if manifest.contains("python-torch") {
             let model_id = serde_json::from_str::<serde_json::Value>(&manifest)
                 .ok()
-                .and_then(|v| v.get("model_id").and_then(|x| x.as_str()).map(str::to_string))
+                .and_then(|v| {
+                    v.get("model_id")
+                        .and_then(|x| x.as_str())
+                        .map(str::to_string)
+                })
                 .unwrap_or_else(|| "local-torch".to_string());
             return format!("local trained model ({})", model_id);
         }
     }
-    let model = std::env::var("CODEMORPH_OLLAMA_MODEL").unwrap_or_else(|_| "beam:cloud".to_string());
+    let model =
+        std::env::var("CODEMORPH_OLLAMA_MODEL").unwrap_or_else(|_| "beam:cloud".to_string());
     format!("Ollama teacher ({})", model)
 }
 
-
 fn resolve_models_root() -> String {
     if let Ok(value) = std::env::var("CODEMORPH_MODELS_ROOT") {
-        if !value.trim().is_empty() { return value; }
+        if !value.trim().is_empty() {
+            return value;
+        }
     }
     // Prefer the per-user global registry for installed binaries.
-    let home_candidate = format!("{}/.codemorph/models", std::env::var("HOME").unwrap_or_default());
-    if std::path::PathBuf::from(&home_candidate).join("translator").join("manifest.json").exists() {
+    let home_candidate = format!(
+        "{}/.codemorph/models",
+        std::env::var("HOME").unwrap_or_default()
+    );
+    if std::path::PathBuf::from(&home_candidate)
+        .join("translator")
+        .join("manifest.json")
+        .exists()
+    {
         return home_candidate;
     }
     let cwd = std::path::PathBuf::from("models");
@@ -261,17 +431,25 @@ fn resolve_models_root() -> String {
         }
     }
     // Installed/global single-user model location.
-    let home_candidate = format!("{}/.codemorph/models", std::env::var("HOME").unwrap_or_default());
-    if std::path::PathBuf::from(&home_candidate).join("translator").join("manifest.json").exists() {
+    let home_candidate = format!(
+        "{}/.codemorph/models",
+        std::env::var("HOME").unwrap_or_default()
+    );
+    if std::path::PathBuf::from(&home_candidate)
+        .join("translator")
+        .join("manifest.json")
+        .exists()
+    {
         return home_candidate;
     }
     "models".to_string()
 }
 
-
 fn resolve_pythonpath() -> String {
     if let Ok(value) = std::env::var("CODEMORPH_PYTHONPATH") {
-        if !value.trim().is_empty() { return value; }
+        if !value.trim().is_empty() {
+            return value;
+        }
     }
     let cwd = std::path::PathBuf::from("python");
     if cwd.join("codemorph_ml").join("inference.py").exists() {
@@ -288,13 +466,25 @@ fn resolve_pythonpath() -> String {
     ".".to_string()
 }
 
-
-
-pub fn migrate(input: PathBuf, output: PathBuf, stage: String, full: bool, use_ollama: bool, cases: usize, seed: u64, include_stages: Option<String>, skip_stages: Option<String>) {
+#[allow(clippy::too_many_arguments)]
+pub fn migrate(
+    input: PathBuf,
+    output: PathBuf,
+    stage: String,
+    full: bool,
+    use_ollama: bool,
+    cases: usize,
+    seed: u64,
+    include_stages: Option<String>,
+    skip_stages: Option<String>,
+) {
     let _ = include_stages;
     let _ = skip_stages;
 
-    let allow_ollama = use_ollama || std::env::var("CODEMORPH_USE_OLLAMA").map(|v| v == "1").unwrap_or(false);
+    let allow_ollama = use_ollama
+        || std::env::var("CODEMORPH_USE_OLLAMA")
+            .map(|v| v == "1")
+            .unwrap_or(false);
 
     std::fs::create_dir_all(&output).ok();
     let codemorph_dir = output.join(".codemorph");
@@ -312,43 +502,66 @@ pub fn migrate(input: PathBuf, output: PathBuf, stage: String, full: bool, use_o
             return;
         }
         "translate" => {
-            if !input.exists() { eprintln!("input does not exist"); return; }
-            let mut source_files = Vec::new();
-            if input.is_file() { source_files.push(input.clone()); } else {
-                fn walk(dir: &PathBuf, out: &mut Vec<PathBuf>) {
-                    if let Ok(read) = std::fs::read_dir(dir) {
-                        for entry in read.flatten() {
-                            let p = entry.path();
-                            if p.is_dir() { walk(&p, out); }
-                            else if let Some(ext)=p.extension().and_then(|x|x.to_str()) {
-                                if matches!(ext, "cpp"|"cc"|"cxx"|"c"|"h"|"hpp") { out.push(p); }
-                            }
-                        }
-                    }
-                }
-                walk(&input,&mut source_files);
+            if !input.exists() {
+                eprintln!("input does not exist");
+                return;
             }
+            let source_files = collect_source_files(&input);
             let mut summary = Vec::new();
+            let mut verified = 0usize;
+            let mut compiled = 0usize;
+            let mut unsupported = 0usize;
+            let mut failed = 0usize;
             for source_path in &source_files {
-                let rel = if input.is_dir() { source_path.strip_prefix(&input).unwrap_or(source_path).to_path_buf() } else { source_path.file_name().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("input.rs")) };
+                let rel = if input.is_dir() {
+                    source_path
+                        .strip_prefix(&input)
+                        .unwrap_or(source_path)
+                        .to_path_buf()
+                } else {
+                    source_path
+                        .file_name()
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| PathBuf::from("input.rs"))
+                };
                 let out_path = output.join(rel.with_extension("rs"));
-                if let Some(p)=out_path.parent(){std::fs::create_dir_all(p).ok();}
-                let source_cpp = std::fs::read_to_string(source_path).unwrap_or_default();
-                let candidate = deterministic_translation(&source_cpp).or_else(|| {
-                    generate_translation(&build_translation_prompt(&source_cpp), true, true).ok().map(|x| clean_text(&x))
-                }).unwrap_or_default();
-                let _ = std::fs::write(&out_path, &candidate);
-                let status = if write_and_check_rust(&out_path, &candidate) { "compiled" } else { "failed" };
+                if let Some(p) = out_path.parent() {
+                    std::fs::create_dir_all(p).ok();
+                }
+                let source_cpp = match std::fs::read_to_string(source_path) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("cannot read {}: {}", source_path.display(), e);
+                        failed += 1;
+                        continue;
+                    }
+                };
+                let status = translate_one(&source_cpp, &out_path, allow_ollama);
+                match &status {
+                    FileStatus::Verified => verified += 1,
+                    FileStatus::Compiled => compiled += 1,
+                    FileStatus::Unsupported(_) => unsupported += 1,
+                    FileStatus::Failed(_) => failed += 1,
+                }
+                let output_value = match &status {
+                    FileStatus::Unsupported(_) => serde_json::Value::Null,
+                    _ => serde_json::json!(out_path.display().to_string()),
+                };
                 summary.push(serde_json::json!({
                     "source": source_path.display().to_string(),
-                    "output": out_path.display().to_string(),
-                    "status": status
+                    "output": output_value,
+                    "status": status.status_str(),
+                    "reason": status.reason(),
                 }));
             }
             let path = stage_dir.join("translate.json");
-            let _ = std::fs::write(&path, serde_json::to_string_pretty(&summary).unwrap_or_default());
+            let _ = std::fs::write(
+                &path,
+                serde_json::to_string_pretty(&summary).unwrap_or_default(),
+            );
             println!("translated artifacts: {}", summary.len());
             println!("artifact: {}", path.display());
+            print_summary(verified, compiled, unsupported, failed, source_files.len());
             println!("status: translate complete");
             return;
         }
@@ -364,7 +577,10 @@ pub fn migrate(input: PathBuf, output: PathBuf, stage: String, full: bool, use_o
                 }
             }
             let path = stage_dir.join("repair.json");
-            let _ = std::fs::write(&path, serde_json::to_string_pretty(&results).unwrap_or_default());
+            let _ = std::fs::write(
+                &path,
+                serde_json::to_string_pretty(&results).unwrap_or_default(),
+            );
             println!("repair stage complete: {} files scanned", results.len());
             println!("artifact: {}", path.display());
             return;
@@ -373,22 +589,33 @@ pub fn migrate(input: PathBuf, output: PathBuf, stage: String, full: bool, use_o
             let mut reports = Vec::new();
             for source_path in collect_cpp_files(&input) {
                 let source = std::fs::read_to_string(&source_path).unwrap_or_default();
-                if source.trim().is_empty() { continue; }
+                if source.trim().is_empty() {
+                    continue;
+                }
                 match role_model_generate("ownership", &format!("Classify ownership recommendation.\n{}", source)) {
                     Ok(resp) => reports.push(serde_json::json!({ "file": source_path.display().to_string(), "status": "model-checked", "note": clean_text(&resp) })),
                     Err(e) => reports.push(serde_json::json!({ "file": source_path.display().to_string(), "status": e })),
                 }
             }
             let path = stage_dir.join("ownership.json");
-            let _ = std::fs::write(&path, serde_json::to_string_pretty(&reports).unwrap_or_default());
-            println!("ownership stage: {} files, artifact {}", reports.len(), path.display());
+            let _ = std::fs::write(
+                &path,
+                serde_json::to_string_pretty(&reports).unwrap_or_default(),
+            );
+            println!(
+                "ownership stage: {} files, artifact {}",
+                reports.len(),
+                path.display()
+            );
             return;
         }
         "idiomatize" => {
             let mut reports = Vec::new();
             for rust_path in collect_rust_files(&output) {
                 let source = std::fs::read_to_string(&rust_path).unwrap_or_default();
-                if source.trim().is_empty() { continue; }
+                if source.trim().is_empty() {
+                    continue;
+                }
                 match role_model_generate("idiomatizer", &format!("Rewrite Rust more idiomatically while preserving behavior. Return code only.\n{}", source)) {
                     Ok(candidate) => {
                         let candidate = clean_text(&candidate);
@@ -399,32 +626,48 @@ pub fn migrate(input: PathBuf, output: PathBuf, stage: String, full: bool, use_o
                 }
             }
             let path = stage_dir.join("idiomatize.json");
-            let _ = std::fs::write(&path, serde_json::to_string_pretty(&reports).unwrap_or_default());
-            println!("idiomatize stage: {} files, artifact {}", reports.len(), path.display());
+            let _ = std::fs::write(
+                &path,
+                serde_json::to_string_pretty(&reports).unwrap_or_default(),
+            );
+            println!(
+                "idiomatize stage: {} files, artifact {}",
+                reports.len(),
+                path.display()
+            );
             return;
         }
         "verify" => {
             let manifest_path = output.join(".codemorph").join("migration-report.json");
-            if let Ok(text)=std::fs::read_to_string(&manifest_path) {
-                if let Ok(jsonv)=serde_json::from_str::<serde_json::Value>(&text) {
-                    if let Some(files)=jsonv.get("files").and_then(|v|v.as_array()) {
-                        let mut ok=0;
+            if let Ok(text) = std::fs::read_to_string(&manifest_path) {
+                if let Ok(jsonv) = serde_json::from_str::<serde_json::Value>(&text) {
+                    if let Some(files) = jsonv.get("files").and_then(|v| v.as_array()) {
+                        let mut ok = 0;
                         for f in files {
-                            let src = f.get("source").and_then(|v|v.as_str()).map(PathBuf::from);
-                            let out = f.get("output").and_then(|v|v.as_str()).map(PathBuf::from);
-                            if let (Some(src),Some(outp))=(src,out) {
-                                let source_cpp=std::fs::read_to_string(&src).unwrap_or_default();
-                                let generated=std::fs::read_to_string(&outp).unwrap_or_default();
-                                let (pass, _count)=behavior_check(&source_cpp,&generated,cases,seed);
-                                println!("  {} -> {}", src.display(), if pass {"OK"} else {"MISMATCH"});
-                                if pass { ok+=1; }
+                            let src = f.get("source").and_then(|v| v.as_str()).map(PathBuf::from);
+                            let out = f.get("output").and_then(|v| v.as_str()).map(PathBuf::from);
+                            if let (Some(src), Some(outp)) = (src, out) {
+                                let source_cpp = std::fs::read_to_string(&src).unwrap_or_default();
+                                let generated = std::fs::read_to_string(&outp).unwrap_or_default();
+                                let (pass, _count) =
+                                    behavior_check(&source_cpp, &generated, cases, seed);
+                                println!(
+                                    "  {} -> {}",
+                                    src.display(),
+                                    if pass { "OK" } else { "MISMATCH" }
+                                );
+                                if pass {
+                                    ok += 1;
+                                }
                             }
                         }
                         println!("verified: {}/{}", ok, files.len());
                     }
                 }
             } else {
-                eprintln!("Run migrate --stage all or translate first to produce migration-report.json");
+                eprintln!(
+                    "Run migrate --stage all or translate first to produce migration-report.json"
+                );
             }
             return;
         }
@@ -448,38 +691,35 @@ pub fn migrate(input: PathBuf, output: PathBuf, stage: String, full: bool, use_o
     }
 
     std::fs::create_dir_all(&output).ok();
-    let mut source_files = Vec::new();
-    if input.is_file() {
-        source_files.push(input.clone());
-    } else {
-        fn walk(dir: &PathBuf, out: &mut Vec<PathBuf>) {
-            if let Ok(read) = std::fs::read_dir(dir) {
-                for entry in read.flatten() {
-                    let p = entry.path();
-                    if p.is_dir() {
-                        walk(&p, out);
-                    } else if let Some(ext) = p.extension().and_then(|x| x.to_str()) {
-                        if matches!(ext, "cpp" | "cc" | "cxx" | "c" | "h" | "hpp") {
-                            out.push(p);
-                        }
-                    }
-                }
-            }
-        }
-        walk(&input, &mut source_files);
+    let source_files = collect_source_files(&input);
+    let source_files_is_empty = source_files.is_empty();
+
+    println!(
+        "translator backend selected: {}",
+        selected_translation_backend()
+    );
+
+    struct FileResult {
+        source: PathBuf,
+        output: Option<PathBuf>,
+        status: FileStatus,
+        behavior_verified: bool,
+        behavior_passed: u64,
+        behavior_total: u64,
     }
 
-    println!("translator backend selected: {}", selected_translation_backend());
-
-    let mut manifest: Vec<serde_json::Value> = Vec::new();
-    let mut translated = 0usize;
-    let mut failed = 0usize;
-    let source_files_is_empty = source_files.is_empty();
+    let mut results: Vec<FileResult> = Vec::new();
     for source_path in &source_files {
         let rel = if input.is_dir() {
-            source_path.strip_prefix(&input).unwrap_or(source_path).to_path_buf()
+            source_path
+                .strip_prefix(&input)
+                .unwrap_or(source_path)
+                .to_path_buf()
         } else {
-            source_path.file_name().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("input.rs"))
+            source_path
+                .file_name()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("input.rs"))
         };
         let out_path = output.join(rel.with_extension("rs"));
         if let Some(parent) = out_path.parent() {
@@ -490,117 +730,161 @@ pub fn migrate(input: PathBuf, output: PathBuf, stage: String, full: bool, use_o
             Ok(s) => s,
             Err(e) => {
                 eprintln!("cannot read {}: {}", source_path.display(), e);
-                failed += 1;
+                results.push(FileResult {
+                    source: source_path.clone(),
+                    output: None,
+                    status: FileStatus::Failed(format!("cannot read source: {}", e)),
+                    behavior_verified: false,
+                    behavior_passed: 0,
+                    behavior_total: 0,
+                });
                 continue;
             }
         };
 
-        print!("translating {} via {} ... ", source_path.display(), selected_translation_backend());
-        let candidate = match (allow_ollama, deterministic_translation(&source_cpp)) {
-            (_, Some(x)) => clean_text(&x),
-            _ => match generate_translation(&build_translation_prompt(&source_cpp), true, allow_ollama) {
-                Ok(x) => clean_text(&x),
-                Err(e) => {
-                    println!("FAILED ({e})");
-                    failed += 1;
-                    continue;
-                }
-            }
-        };
-
-        let compile_ok = write_and_check_rust(&out_path, &candidate);
-        if !compile_ok {
-            print!("repairing {} ... ", out_path.display());
-            let repair_prompt = format!(
-                "You are repairing Rust code. Return ONLY complete valid Rust source, no markdown and no explanation. Original C++:\n```cpp\n{}\n```\nBroken Rust:\n```rust\n{}\n```",
-                source_cpp, candidate
-            );
-            if let Ok(repaired) = generate_translation(&repair_prompt, false, allow_ollama) {
-                let repaired = clean_text(&repaired);
-                if write_and_check_rust(&out_path, &repaired) {
-                    println!("compiled after repair");
-                    translated += 1;
-                } else {
-                    println!("still failed");
-                    failed += 1;
-                }
-            } else {
-                println!("repair generation failed");
-                failed += 1;
-            }
-        } else {
-            println!("compiled");
-            translated += 1;
+        print!("translating {} ... ", source_path.display());
+        let status = translate_one(&source_cpp, &out_path, allow_ollama);
+        match &status {
+            FileStatus::Verified => println!("verified"),
+            FileStatus::Compiled => println!("compiled"),
+            FileStatus::Unsupported(r) => println!("unsupported ({})", r),
+            FileStatus::Failed(r) => println!("failed ({})", r),
         }
-
-        manifest.push(serde_json::json!({
-            "source": source_path.display().to_string(),
-            "output": out_path.display().to_string(),
-            "model": "auto",
-            "behavior_verified": false,
-            "behavior_passed_inputs": 0,
-            "behavior_total_inputs": 0,
-        }));
+        let output_value = match &status {
+            FileStatus::Unsupported(_) => None,
+            _ => Some(out_path.clone()),
+        };
+        results.push(FileResult {
+            source: source_path.clone(),
+            output: output_value,
+            status,
+            behavior_verified: false,
+            behavior_passed: 0,
+            behavior_total: 0,
+        });
     }
 
-    let mut behavior_verified_files = 0usize;
     if full {
         println!("Behavior verification stage: {} cases per file", cases);
-        for entry in manifest.iter_mut() {
-            let source_path = entry.get("source").and_then(|v| v.as_str()).map(PathBuf::from);
-            let out_path = entry.get("output").and_then(|v| v.as_str()).map(PathBuf::from);
-            if let (Some(source_path), Some(out_path)) = (source_path, out_path) {
-                if !source_path.exists() || !out_path.exists() { continue; }
-                let source_cpp = std::fs::read_to_string(&source_path).unwrap_or_default();
-                let generated_rust = std::fs::read_to_string(&out_path).unwrap_or_default();
-                if source_cpp.is_empty() || generated_rust.is_empty() { continue; }
-                let (ok, passed) = behavior_check(&source_cpp, &generated_rust, cases, seed);
-                entry["behavior_total_inputs"] = serde_json::json!(cases);
-                entry["behavior_passed_inputs"] = serde_json::json!(passed);
-                entry["behavior_verified"] = serde_json::json!(ok);
-                if ok { behavior_verified_files += 1; }
-                println!("  {} -> behavior {}", source_path.display(), if ok { "OK" } else { "MISMATCH" });
+        for r in results.iter_mut() {
+            if !matches!(r.status, FileStatus::Compiled) {
+                continue;
             }
+            let out_path = match &r.output {
+                Some(p) => p.clone(),
+                None => continue,
+            };
+            if !r.source.exists() || !out_path.exists() {
+                continue;
+            }
+            let source_cpp = std::fs::read_to_string(&r.source).unwrap_or_default();
+            let generated_rust = std::fs::read_to_string(&out_path).unwrap_or_default();
+            if source_cpp.is_empty() || generated_rust.is_empty() {
+                continue;
+            }
+            let (ok, passed) = behavior_check(&source_cpp, &generated_rust, cases, seed);
+            r.behavior_total = cases as u64;
+            r.behavior_passed = passed;
+            if ok {
+                r.behavior_verified = true;
+                r.status = FileStatus::Verified;
+            } else {
+                r.status =
+                    FileStatus::Failed(format!("behavior mismatch ({}/{})", passed, cases.max(1)));
+            }
+            println!(
+                "  {} -> behavior {}",
+                r.source.display(),
+                if ok { "OK" } else { "MISMATCH" }
+            );
         }
-        println!("behavior verified files: {}/{}", behavior_verified_files, manifest.len());
     }
+
+    let verified = results
+        .iter()
+        .filter(|r| matches!(r.status, FileStatus::Verified))
+        .count();
+    let compiled = results
+        .iter()
+        .filter(|r| matches!(r.status, FileStatus::Compiled))
+        .count();
+    let unsupported = results
+        .iter()
+        .filter(|r| matches!(r.status, FileStatus::Unsupported(_)))
+        .count();
+    let failed = results
+        .iter()
+        .filter(|r| matches!(r.status, FileStatus::Failed(_)))
+        .count();
+
+    let manifest: Vec<serde_json::Value> = results
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "source": r.source.display().to_string(),
+                "output": r.output.as_ref().map(|p| p.display().to_string()),
+                "status": r.status.status_str(),
+                "reason": r.status.reason(),
+                "behavior_verified": r.behavior_verified,
+                "behavior_passed_inputs": r.behavior_passed,
+                "behavior_total_inputs": r.behavior_total,
+            })
+        })
+        .collect();
 
     let stage_dir = output.join(".codemorph").join("stages");
     let _ = std::fs::create_dir_all(&stage_dir);
-    let mut translate_summary = Vec::new();
-    let mut verify_summary = Vec::new();
-    for entry in &manifest {
-        translate_summary.push(serde_json::json!({
-            "source": entry.get("source"),
-            "translation": entry.get("output"),
-            "status": if entry.get("behavior_verified").and_then(|v|v.as_bool()).unwrap_or(false) { "translated" } else { "pending" },
-        }));
-        verify_summary.push(serde_json::json!({
-            "source": entry.get("source"),
-            "output": entry.get("output"),
-            "behavior_passed_inputs": entry.get("behavior_passed_inputs"),
-            "behavior_total_inputs": entry.get("behavior_total_inputs"),
-            "behavior_verified": entry.get("behavior_verified"),
-        }));
-    }
-    let _ = std::fs::write(stage_dir.join("translate.json"), serde_json::to_string_pretty(&translate_summary).unwrap_or_default());
+    let translate_summary: Vec<serde_json::Value> = results
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "source": r.source.display().to_string(),
+                "translation": r.output.as_ref().map(|p| p.display().to_string()),
+                "status": r.status.status_str(),
+                "reason": r.status.reason(),
+            })
+        })
+        .collect();
+    let verify_summary: Vec<serde_json::Value> = results
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "source": r.source.display().to_string(),
+                "output": r.output.as_ref().map(|p| p.display().to_string()),
+                "behavior_passed_inputs": r.behavior_passed,
+                "behavior_total_inputs": r.behavior_total,
+                "behavior_verified": r.behavior_verified,
+            })
+        })
+        .collect();
+    let _ = std::fs::write(
+        stage_dir.join("translate.json"),
+        serde_json::to_string_pretty(&translate_summary).unwrap_or_default(),
+    );
     let _ = std::fs::write(stage_dir.join("repair.json"), "[]");
-    let _ = std::fs::write(stage_dir.join("verify.json"), serde_json::to_string_pretty(&verify_summary).unwrap_or_default());
+    let _ = std::fs::write(
+        stage_dir.join("verify.json"),
+        serde_json::to_string_pretty(&verify_summary).unwrap_or_default(),
+    );
 
     let report = serde_json::json!({
         "input": input.display().to_string(),
         "output": output.display().to_string(),
-        "translated": translated,
+        "verified": verified,
+        "compiled": compiled,
+        "unsupported": unsupported,
         "failed": failed,
-        "behavior_verified_files": behavior_verified_files,
+        "total": results.len(),
         "files": manifest,
     });
     std::fs::create_dir_all(output.join(".codemorph")).ok();
     let report_path = output.join(".codemorph").join("migration-report.json");
-    let _ = std::fs::write(&report_path, serde_json::to_string_pretty(&report).unwrap_or_default());
+    let _ = std::fs::write(
+        &report_path,
+        serde_json::to_string_pretty(&report).unwrap_or_default(),
+    );
 
-    println!("translated: {}", translated);
-    println!("failed: {}", failed);
+    print_summary(verified, compiled, unsupported, failed, results.len());
     println!("report: {}", report_path.display());
     if source_files_is_empty {
         println!("status: no source files found");
@@ -720,7 +1004,6 @@ pub fn benchmark(
     println!("rust_over_cpp_ratio: {:.3}", ratio);
 }
 
-
 fn build_translation_prompt(source_cpp: &str) -> String {
     format!(
         "Translate the following C/C++ code into a complete Rust program. Preserve behavior, signatures, and main when present. Return only Rust code, no markdown, no explanation.\n\n{}",
@@ -730,15 +1013,22 @@ fn build_translation_prompt(source_cpp: &str) -> String {
 
 fn clean_text(text: &str) -> String {
     let mut lines = text.trim().lines().collect::<Vec<_>>();
-    if lines.first().map(|x| x.trim().starts_with("```")).unwrap_or(false) {
+    if lines
+        .first()
+        .map(|x| x.trim().starts_with("```"))
+        .unwrap_or(false)
+    {
         lines.remove(0);
     }
-    while lines.last().map(|x| x.trim().starts_with("```")).unwrap_or(false) {
+    while lines
+        .last()
+        .map(|x| x.trim().starts_with("```"))
+        .unwrap_or(false)
+    {
         lines.pop();
     }
     lines.join("\n").trim().to_string()
 }
-
 
 fn python_ollama_generate(model: &str, prompt: &str) -> Result<String, String> {
     use codemorph_core::sandbox::{ExecutionLimits, ExecutionRequest};
@@ -770,12 +1060,21 @@ print(candidates[0].text, end="")
         cwd: None,
         env,
         stdin: Some(prompt.to_string()),
-        limits: ExecutionLimits { timeout_ms: 300_000, ..Default::default() },
+        limits: ExecutionLimits {
+            timeout_ms: 300_000,
+            ..Default::default()
+        },
     };
     let res = Sandbox::execute(&req).map_err(|e| e.to_string())?;
-    if res.timed_out { return Err("python ollama timeout".to_string()); }
-    if res.exit_code != Some(0) { return Err(res.stderr); }
-    if res.stdout.trim().is_empty() { return Err(format!("empty result; stderr={}", res.stderr)); }
+    if res.timed_out {
+        return Err("python ollama timeout".to_string());
+    }
+    if res.exit_code != Some(0) {
+        return Err(res.stderr);
+    }
+    if res.stdout.trim().is_empty() {
+        return Err(format!("empty result; stderr={}", res.stderr));
+    }
     Ok(res.stdout)
 }
 
@@ -788,45 +1087,128 @@ fn write_and_check_rust(path: &std::path::Path, source: &str) -> bool {
     result.success
 }
 
-
-
 fn behavior_check(cpp_source: &str, rust_source: &str, cases: usize, seed: u64) -> (bool, u64) {
     use codemorph_core::sandbox::{ExecutionLimits, ExecutionRequest};
     use codemorph_sandbox::Sandbox;
     use codemorph_verify::SeededRng;
     use tempfile::TempDir;
 
-    let dir = match TempDir::new() { Ok(d) => d, Err(_) => return (false, 0) };
+    let dir = match TempDir::new() {
+        Ok(d) => d,
+        Err(_) => return (false, 0),
+    };
     let cpp_path = dir.path().join("cpp.out");
     let rust_path = dir.path().join("rust.out");
     let cpp_src = dir.path().join("main.cpp");
     let rust_src = dir.path().join("main.rs");
-    if std::fs::write(&cpp_src,cpp_source).is_err() { return (false,0); }
-    if std::fs::write(&rust_src,rust_source).is_err() { return (false,0); }
+    if std::fs::write(&cpp_src, cpp_source).is_err() {
+        return (false, 0);
+    }
+    if std::fs::write(&rust_src, rust_source).is_err() {
+        return (false, 0);
+    }
 
-    let compile_cpp = ExecutionRequest { program: "g++".to_string(), args: vec!["-std=c++17".into(),"-O2".into(),"-o".into(),cpp_path.display().to_string(),cpp_src.display().to_string()], cwd: None, env: vec![], stdin: None, limits: ExecutionLimits { timeout_ms: 30_000, ..Default::default() } };
-    let compile_rust = ExecutionRequest { program: "rustc".to_string(), args: vec!["-O".into(),"-o".into(),rust_path.display().to_string(),rust_src.display().to_string()], cwd: None, env: vec![], stdin: None, limits: ExecutionLimits { timeout_ms: 30_000, ..Default::default() } };
+    let compile_cpp = ExecutionRequest {
+        program: "g++".to_string(),
+        args: vec![
+            "-std=c++17".into(),
+            "-O2".into(),
+            "-o".into(),
+            cpp_path.display().to_string(),
+            cpp_src.display().to_string(),
+        ],
+        cwd: None,
+        env: vec![],
+        stdin: None,
+        limits: ExecutionLimits {
+            timeout_ms: 30_000,
+            ..Default::default()
+        },
+    };
+    let compile_rust = ExecutionRequest {
+        program: "rustc".to_string(),
+        args: vec![
+            "-O".into(),
+            "-o".into(),
+            rust_path.display().to_string(),
+            rust_src.display().to_string(),
+        ],
+        cwd: None,
+        env: vec![],
+        stdin: None,
+        limits: ExecutionLimits {
+            timeout_ms: 30_000,
+            ..Default::default()
+        },
+    };
 
-    if Sandbox::execute(&compile_cpp).map(|r|r.exit_code).unwrap_or(None) != Some(0) { return (false,0); }
-    if Sandbox::execute(&compile_rust).map(|r|r.exit_code).unwrap_or(None) != Some(0) { return (false,0); }
+    if Sandbox::execute(&compile_cpp)
+        .map(|r| r.exit_code)
+        .unwrap_or(None)
+        != Some(0)
+    {
+        return (false, 0);
+    }
+    if Sandbox::execute(&compile_rust)
+        .map(|r| r.exit_code)
+        .unwrap_or(None)
+        != Some(0)
+    {
+        return (false, 0);
+    }
 
     let mut rng = SeededRng::new(seed);
     let mut passed = 0u64;
+    // Feed enough integer tokens to exercise programs that read more than two
+    // inputs (e.g. four-operand fixtures). Programs that read fewer simply
+    // ignore the remaining tokens, so a single generous shape is safe and
+    // avoids vacuous verification of multi-input programs.
+    const INPUT_TOKENS: usize = 8;
     for _ in 0..cases.max(1) {
-        let input = format!("{} {}\n", rng.next_i32(-10,10), rng.next_i32(-10,10));
-        let run_cpp = ExecutionRequest { program: cpp_path.to_string_lossy().into(), args: vec![], cwd: None, env: vec![], stdin: Some(input.clone()), limits: ExecutionLimits { timeout_ms: 5_000, ..Default::default() } };
-        let run_rust = ExecutionRequest { program: rust_path.to_string_lossy().into(), args: vec![], cwd: None, env: vec![], stdin: Some(input.clone()), limits: ExecutionLimits { timeout_ms: 5_000, ..Default::default() } };
+        let mut input = String::new();
+        for i in 0..INPUT_TOKENS {
+            if i > 0 {
+                input.push(' ');
+            }
+            input.push_str(&rng.next_i32(-10, 10).to_string());
+        }
+        input.push('\n');
+        let run_cpp = ExecutionRequest {
+            program: cpp_path.to_string_lossy().into(),
+            args: vec![],
+            cwd: None,
+            env: vec![],
+            stdin: Some(input.clone()),
+            limits: ExecutionLimits {
+                timeout_ms: 5_000,
+                ..Default::default()
+            },
+        };
+        let run_rust = ExecutionRequest {
+            program: rust_path.to_string_lossy().into(),
+            args: vec![],
+            cwd: None,
+            env: vec![],
+            stdin: Some(input.clone()),
+            limits: ExecutionLimits {
+                timeout_ms: 5_000,
+                ..Default::default()
+            },
+        };
         match (Sandbox::execute(&run_cpp), Sandbox::execute(&run_rust)) {
-            (Ok(c), Ok(r)) if c.exit_code == r.exit_code && c.stdout == r.stdout && !c.timed_out && !r.timed_out => passed += 1,
+            (Ok(c), Ok(r))
+                if c.exit_code == r.exit_code
+                    && c.stdout == r.stdout
+                    && !c.timed_out
+                    && !r.timed_out =>
+            {
+                passed += 1
+            }
             _ => return (false, passed),
         }
     }
     (passed == cases.max(1) as u64 && cases > 0, passed)
 }
-
-
-
-
 
 fn collect_rust_files(root: &std::path::PathBuf) -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
@@ -834,8 +1216,11 @@ fn collect_rust_files(root: &std::path::PathBuf) -> Vec<std::path::PathBuf> {
         if let Ok(read) = std::fs::read_dir(dir) {
             for entry in read.flatten() {
                 let p = entry.path();
-                if p.is_dir() { walk(&p, out); }
-                else if p.extension().and_then(|x|x.to_str()) == Some("rs") { out.push(p); }
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().and_then(|x| x.to_str()) == Some("rs") {
+                    out.push(p);
+                }
             }
         }
     }
@@ -844,68 +1229,18 @@ fn collect_rust_files(root: &std::path::PathBuf) -> Vec<std::path::PathBuf> {
     out
 }
 
-fn deterministic_translation(source: &str) -> Option<String> {
-    if !source.contains("int main") {
-        return None;
-    }
-    let mut out = String::new();
-    // Basic preprocessing: drop common C++ includes.
-    for line in source.lines() {
-        let line = line.trim();
-        if line.starts_with("#include") { continue; }
-        if line == "using namespace std;" { continue; }
-        out.push_str(line);
-        out.push('\n');
-    }
-    // Minimal syntactic conversions.
-    out = out.replace("int main(){", "fn main() {");
-    out = out.replace("int main() {", "fn main() {");
-    out = out.replace("std::cout << ", r#"println!("{}", "#);
-    out = out.replace(" << std::endl;", ");");
-
-    // Single-string input `println(&quot;{}", "hello\n");`
-    out = out.replace("println!(\"{}\", \"hello\\n\")", "println!(\"hello\")");
-
-    out = out.replace("std::endl", "");
-    // A trailing bare return 0 is removed for Rust main unit.
-    out = out.replace("return 0;", "");
-    // Close println candidates that currently end with `;`.
-    // Close transformed statements that ended with a semicolon.
-    if let Some(start) = out.find("println!(\"{}\", ") {
-        if let Some(end) = out[start..].find(';') {
-            let end = start + end;
-            out.replace_range(end..end+1, ")");
-            out.insert(end + 1, ';');
-        }
-    }
-
-    // A single Rust string literal such as "hello\n" already carries the newline.
-    // Do not append another one.
-    if out.contains(r#"\n""#) {
-        out = out.replace("println!", "print!");
-    }
-
-    if out.contains("fn main") {
-        if !out.trim_end().ends_with('}') {
-            out.push('}');
-        }
-        Some(out.trim().to_string())
-    } else {
-        None
-    }
-}
-
-
-
 fn collect_cpp_files(root: &PathBuf) -> Vec<PathBuf> {
     let mut out = Vec::new();
     fn walk(dir: &PathBuf, out: &mut Vec<PathBuf>) {
         if let Ok(read) = std::fs::read_dir(dir) {
             for entry in read.flatten() {
                 let p = entry.path();
-                if p.is_dir() { walk(&p, out); }
-                else if let Some(ext)=p.extension().and_then(|x|x.to_str()) {
-                    if matches!(ext, "cpp"|"cc"|"cxx"|"c"|"h"|"hpp") { out.push(p); }
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if let Some(ext) = p.extension().and_then(|x| x.to_str()) {
+                    if matches!(ext, "cpp" | "cc" | "cxx" | "c" | "h" | "hpp") {
+                        out.push(p);
+                    }
                 }
             }
         }
@@ -916,39 +1251,52 @@ fn collect_cpp_files(root: &PathBuf) -> Vec<PathBuf> {
 }
 
 fn role_model_generate(role: &str, prompt: &str) -> Result<String, String> {
-    let models_root = std::env::var("CODEMORPH_MODELS_ROOT").unwrap_or_else(|_| "models".to_string());
+    let models_root =
+        std::env::var("CODEMORPH_MODELS_ROOT").unwrap_or_else(|_| "models".to_string());
     let model_dir = PathBuf::from(models_root).join(role);
     let manifest_path = model_dir.join("manifest.json");
-    if !manifest_path.exists() { return Err(format!("model missing for {}", role)); }
+    if !manifest_path.exists() {
+        return Err(format!("model missing for {}", role));
+    }
     let manifest = std::fs::read_to_string(&manifest_path).unwrap_or_default();
-    if !manifest.contains("python-torch") { return Err(format!("unsupported backend for {}", role)); }
+    if !manifest.contains("python-torch") {
+        return Err(format!("unsupported backend for {}", role));
+    }
     let python = resolve_python();
-    let mut pythonpath = std::env::var("CODEMORPH_PYTHONPATH").unwrap_or_else(|_| "python".to_string());
-    if !std::path::Path::new(&pythonpath).exists() { pythonpath = ".".to_string(); }
+    let mut pythonpath =
+        std::env::var("CODEMORPH_PYTHONPATH").unwrap_or_else(|_| "python".to_string());
+    if !std::path::Path::new(&pythonpath).exists() {
+        pythonpath = ".".to_string();
+    }
     use codemorph_core::sandbox::{ExecutionLimits, ExecutionRequest};
     use codemorph_sandbox::Sandbox;
     let req = ExecutionRequest {
         program: python.clone(),
-        args: vec!["-m".to_string(), "codemorph_ml.inference".to_string(), "--model-dir".to_string(), model_dir.display().to_string(), "--source-text".to_string(), prompt.to_string()],
+        args: vec![
+            "-m".to_string(),
+            "codemorph_ml.inference".to_string(),
+            "--model-dir".to_string(),
+            model_dir.display().to_string(),
+            "--source-text".to_string(),
+            prompt.to_string(),
+        ],
         cwd: None,
         env: vec![("PYTHONPATH".to_string(), pythonpath)],
         stdin: None,
-        limits: ExecutionLimits { timeout_ms: 120_000, ..Default::default() },
+        limits: ExecutionLimits {
+            timeout_ms: 120_000,
+            ..Default::default()
+        },
     };
     let res = Sandbox::execute(&req).map_err(|e| e.to_string())?;
-    if res.timed_out { return Err(format!("{} timeout", role)); }
-    if res.exit_code != Some(0) { return Err(res.stderr); }
-    if res.stdout.trim().is_empty() { return Err(format!("{} empty", role)); }
-    Ok(res.stdout)
-}
-
-
-#[cfg(test)]
-mod debug_cout_final2 {
-    use super::*;
-    #[test]
-    fn d() {
-        let src = "#include <iostream>\nint main(){std::cout << \"hello\" << \"\\n\"; return 0;}";
-        println!("OUT={:?}", deterministic_translation(src));
+    if res.timed_out {
+        return Err(format!("{} timeout", role));
     }
+    if res.exit_code != Some(0) {
+        return Err(res.stderr);
+    }
+    if res.stdout.trim().is_empty() {
+        return Err(format!("{} empty", role));
+    }
+    Ok(res.stdout)
 }

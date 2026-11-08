@@ -2,6 +2,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 mod commands;
+mod translate;
 
 #[derive(Parser)]
 #[command(
@@ -104,7 +105,27 @@ fn main() {
             input,
             iterations,
         } => commands::benchmark(cpp_source, rust_source, input, iterations),
-        Commands::Migrate { input, output, stage, full, use_ollama, cases, seed, include_stages, skip_stages } => commands::migrate(input, output, stage, full, use_ollama, cases, seed, include_stages, skip_stages),
+        Commands::Migrate {
+            input,
+            output,
+            stage,
+            full,
+            use_ollama,
+            cases,
+            seed,
+            include_stages,
+            skip_stages,
+        } => commands::migrate(
+            input,
+            output,
+            stage,
+            full,
+            use_ollama,
+            cases,
+            seed,
+            include_stages,
+            skip_stages,
+        ),
         Commands::Models { command } => match command {
             ModelCommands::List => commands::models_list(),
             ModelCommands::Validate => commands::models_validate(),

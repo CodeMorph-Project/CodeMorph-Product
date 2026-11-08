@@ -31,7 +31,9 @@ impl RustAdapter {
     pub fn compiler_path() -> Option<PathBuf> {
         if let Ok(value) = std::env::var("CODEMORPH_RUSTC") {
             let path = PathBuf::from(value);
-            if path.exists() { return Some(path); }
+            if path.exists() {
+                return Some(path);
+            }
         }
         if let Ok(path) = which("rustc") {
             // Avoid the i386/old wrappers from /usr/local/bin on some machines.
@@ -43,19 +45,27 @@ impl RustAdapter {
             let toolchains = PathBuf::from(home).join(".rustup").join("toolchains");
             if toolchains.exists() {
                 let mut candidates = Vec::new();
-                for entry in std::fs::read_dir(&toolchains).into_iter().flatten() {
-                    if let Ok(entry) = entry {
-                        let candidate = entry.path().join("bin").join("rustc");
-                        if candidate.exists() { candidates.push(candidate); }
+                for entry in std::fs::read_dir(&toolchains)
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                {
+                    let candidate = entry.path().join("bin").join("rustc");
+                    if candidate.exists() {
+                        candidates.push(candidate);
                     }
                 }
                 candidates.sort();
-                if let Some(path) = candidates.into_iter().last() { return Some(path); }
+                if let Some(path) = candidates.into_iter().last() {
+                    return Some(path);
+                }
             }
         }
         for candidate in ["/opt/homebrew/bin/rustc", "/usr/local/bin/rustc", "rustc"] {
             let path = PathBuf::from(candidate);
-            if path.exists() { return Some(path); }
+            if path.exists() {
+                return Some(path);
+            }
         }
         None
     }
