@@ -671,6 +671,51 @@ pub fn migrate(
             }
             return;
         }
+        "ffi" => {
+            if !input.exists() {
+                eprintln!("input does not exist");
+                return;
+            }
+            let mut sources = Vec::new();
+            if input.is_file() {
+                sources.push(input.clone());
+            } else {
+                collect_cpp_files(&input)
+                    .into_iter()
+                    .for_each(|p| sources.push(p));
+            }
+            std::fs::create_dir_all(&output).ok();
+            let ffi_dir = output.join("ffi");
+            std::fs::create_dir_all(&ffi_dir).ok();
+            let mut count = 0usize;
+            let mut manifest = Vec::new();
+            for source_path in &sources {
+                let source_cpp = std::fs::read_to_string(source_path).unwrap_or_default();
+                let module_name = source_path
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "ffi".to_string());
+                let (module_name, bridge) = (module_name, ffi_bridge_for(source_cpp.as_str()).1);
+                let out_path = ffi_dir.join(format!("{}.rs", module_name));
+                let _ = std::fs::write(&out_path, &bridge);
+                count += 1;
+                manifest.push(serde_json::json!({
+                    "source": source_path.display().to_string(),
+                    "bridge": out_path.display().to_string(),
+                    "status": "scaffold"
+                }));
+            }
+            let path = output.join(".codemorph").join("stages").join("ffi.json");
+            std::fs::create_dir_all(output.join(".codemorph").join("stages")).ok();
+            let _ = std::fs::write(
+                &path,
+                serde_json::to_string_pretty(&manifest).unwrap_or_default(),
+            );
+            println!("ffi stage: {} modules scaffolded", count);
+            println!("artifact: {}", path.display());
+            println!("status: ffi scaffold generated (manual review required)");
+            return;
+        }
         _ => {}
     }
 
@@ -1153,7 +1198,10 @@ fn behavior_check(cpp_source: &str, rust_source: &str, cases: usize, seed: u64) 
         };
         match (Sandbox::execute(&run_cpp), Sandbox::execute(&run_rust)) {
             (Ok(c), Ok(r))
-                if c.exit_code == r.exit_code && c.stdout == r.stdout && !c.timed_out && !r.timed_out =>
+                if c.exit_code == r.exit_code
+                    && c.stdout == r.stdout
+                    && !c.timed_out
+                    && !r.timed_out =>
             {
                 passed += 1;
             }
@@ -1180,6 +1228,118 @@ fn collect_rust_files(root: &std::path::PathBuf) -> Vec<std::path::PathBuf> {
     walk(root, &mut out);
     out.sort();
     out
+}
+
+fn ffi_rust_type(cpp: &str) -> String {
+    let t = cpp.trim();
+    if t.is_empty() || t == "void" {
+        String::new()
+    } else if t.starts_with("int") || t == "size_t" {
+        "i32".to_string()
+    } else if t.starts_with("long") {
+        "i64".to_string()
+    } else if t.starts_with("double") || t.starts_with("float") {
+        "f64".to_string()
+    } else if t.starts_with("bool") {
+        "u8".to_string()
+    } else if t.starts_with("char*") || t.contains("*") {
+        "*mut std::ffi::c_char".to_string()
+    } else if t.starts_with("std::string") {
+        "*const std::ffi::c_char".to_string()
+    } else {
+        "i32".to_string()
+    }
+}
+
+fn extract_top_level_functions(
+    source: &str,
+) -> Vec<(
+    String,      /*ret*/
+    String,      /*name*/
+    Vec<String>, /*param types*/
+)> {
+    let mut out = Vec::new();
+    for line in source.lines() {
+        let t = line.trim();
+        if !t.ends_with('{') {
+            continue;
+        }
+        let sig = t.trim_end_matches('{').trim();
+        let open = match sig.find('(') {
+            Some(i) => i,
+            None => continue,
+        };
+        let name_part = sig[..open].trim();
+        let mut words: Vec<&str> = name_part.split_whitespace().collect();
+        if words.len() < 2 {
+            continue;
+        }
+        let name = words.pop().unwrap().to_string();
+        let ret_type = words.join(" ");
+        if !name.chars().all(|c| c.is_alphanumeric() || c == '_') || name.is_empty() {
+            continue;
+        }
+        let params_text = sig[open + 1..].trim().trim_end_matches(')').trim();
+        let mut param_types = Vec::new();
+        if !params_text.is_empty() {
+            for p in params_text.split(',') {
+                let p = p.trim();
+                if p.is_empty() {
+                    continue;
+                }
+                let words: Vec<&str> = p.split_whitespace().collect();
+                param_types.push(words[..words.len().saturating_sub(1)].join(" "));
+            }
+        }
+        out.push((ret_type, name, param_types));
+    }
+    out
+}
+
+fn ffi_bridge_for(source: &str) -> (String, String) {
+    let funcs = extract_top_level_functions(source);
+    // Derive a module-ish name from the basename; caller overrides path.
+    let mut out = String::new();
+    out.push_str("// Auto-generated FFI bridge scaffold. MANUAL REVIEW REQUIRED.\n");
+    out.push_str("// All bodies initially `unimplemented!()`; lift safe logic into Rust here.\n");
+    out.push_str("#![allow(unused)]\n\n");
+    out.push_str("use std::ffi::c_char;\n\n");
+    for (ret, name, params) in &funcs {
+        let arity = params.len();
+        let ffi_name = format!("codemorph_{}", name);
+        let mut sig = Vec::new();
+        for (i, t) in params.iter().enumerate() {
+            sig.push(format!("arg{}: {}", i + 1, ffi_rust_type(t)));
+        }
+        let param_sig = if sig.is_empty() {
+            String::new()
+        } else {
+            sig.join(", ")
+        };
+        let ret_type = ffi_rust_type(ret);
+        let ret_part = if ret_trimmed_is_void(ret) {
+            String::new()
+        } else {
+            format!(" -> {}", ret_type)
+        };
+        out.push_str(&format!(
+            "/// Bridge for C++ function `{}` ({} args).\n#[no_mangle]\npub extern \"C\" fn {}({}){} {{\n    // TODO: forward to a safe Rust implementation.\n    unimplemented!(\"{} not yet implemented\")\n}}\n\n",
+            name,
+            arity,
+            ffi_name,
+            param_sig,
+            ret_part,
+            name,
+        ));
+    }
+    if funcs.is_empty() {
+        out.push_str("// No top-level functions detected.\n");
+    }
+    ("ffi".to_string(), out)
+}
+
+fn ret_trimmed_is_void(ret: &str) -> bool {
+    ret.trim() == "void"
 }
 
 fn collect_cpp_files(root: &PathBuf) -> Vec<PathBuf> {
