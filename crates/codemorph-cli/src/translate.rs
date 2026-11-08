@@ -296,7 +296,9 @@ fn unsupported_suggestion(name: &str) -> Option<&'static str> {
         "tuple" => Some("tuple (..)"),
         "string_view" => Some("&str"),
         "sort" => Some(".sort() / .sort_unstable()"),
-        "istringstream" | "ostringstream" | "stringstream" => Some("std::io::Cursor / String split"),
+        "istringstream" | "ostringstream" | "stringstream" => {
+            Some("std::io::Cursor / String split")
+        }
         "unique_ptr" => Some("Box<T>"),
         "shared_ptr" => Some("Arc<T>"),
         "make_unique" => Some("Box::new"),
