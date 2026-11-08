@@ -265,7 +265,12 @@ fn detect_unsupported(tokens: &[Tok]) -> Option<String> {
                 _ => None,
             };
             if let Some(r) = reason {
-                return Some(r.to_string());
+                let suggestion = unsupported_suggestion(r);
+                let msg = match suggestion {
+                    Some(s) => format!("{} (suggest: {})", r, s),
+                    None => r.to_string(),
+                };
+                return Some(msg);
             }
         }
         if op_at(tokens, i) == Some("[") {
@@ -277,6 +282,29 @@ fn detect_unsupported(tokens: &[Tok]) -> Option<String> {
         i += 1;
     }
     None
+}
+
+fn unsupported_suggestion(name: &str) -> Option<&'static str> {
+    // Deterministic, non-hallucinated API/library mapping hints (the
+    // idiomatizer model may later refine these). Keep short and crate-focused.
+    match name {
+        "vector" => Some("Vec<T>"),
+        "unordered_map" => Some("HashMap<K, V>"),
+        "map" => Some("HashMap<K, V> (or BTreeMap)"),
+        "set" => Some("HashSet<T> (or BTreeSet)"),
+        "pair" => Some("tuple (a, b)"),
+        "tuple" => Some("tuple (..)"),
+        "string_view" => Some("&str"),
+        "sort" => Some(".sort() / .sort_unstable()"),
+        "istringstream" | "ostringstream" | "stringstream" => Some("std::io::Cursor / String split"),
+        "unique_ptr" => Some("Box<T>"),
+        "shared_ptr" => Some("Arc<T>"),
+        "make_unique" => Some("Box::new"),
+        "make_shared" => Some("Arc::new"),
+        "variant" => Some("enum"),
+        "visit" => Some("match on an enum"),
+        _ => None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1397,7 +1425,12 @@ impl<'a> Codegen<'a> {
             "&self".to_string()
         }];
         for p in &m.params {
-            params.push(format!("{}: {}", p.name, self.rust_param_type(&p.ty)?));
+            let name = if ctx.mutated.contains(&p.name) {
+                format!("mut {}", p.name)
+            } else {
+                p.name.clone()
+            };
+            params.push(format!("{}: {}", name, self.rust_param_type(&p.ty)?));
             ctx.var_types.insert(p.name.clone(), p.ty.base.clone());
             ctx.locals.insert(p.name.clone());
         }
@@ -1425,7 +1458,12 @@ impl<'a> Codegen<'a> {
         let mut params = Vec::new();
         if !is_main {
             for p in &f.params {
-                params.push(format!("{}: {}", p.name, self.rust_param_type(&p.ty)?));
+                let name = if ctx.mutated.contains(&p.name) {
+                    format!("mut {}", p.name)
+                } else {
+                    p.name.clone()
+                };
+                params.push(format!("{}: {}", name, self.rust_param_type(&p.ty)?));
                 ctx.var_types.insert(p.name.clone(), p.ty.base.clone());
                 ctx.locals.insert(p.name.clone());
             }
@@ -1950,8 +1988,14 @@ impl<'a> Codegen<'a> {
                     fmt.push_str(&escaped.replace('{', "{{").replace('}', "}}"));
                 }
                 _ => {
-                    fmt.push_str("{}");
-                    fmt_args.push(self.emit_expr(a, 0, ctx)?);
+                    let rendered = self.emit_expr(a, 0, ctx)?;
+                    if expr_is_bool_expr(a) {
+                        fmt.push_str("{}");
+                        fmt_args.push(format!("({}) as i32", rendered));
+                    } else {
+                        fmt.push_str("{}");
+                        fmt_args.push(rendered);
+                    }
                 }
             }
         }
@@ -1961,6 +2005,21 @@ impl<'a> Codegen<'a> {
 
 fn expr_is_ident(e: &Expr, name: &str) -> bool {
     matches!(e, Expr::Ident(n) if n == name)
+}
+
+fn expr_is_bool_expr(e: &Expr) -> bool {
+    match e {
+        Expr::Binary(op, l, r) => {
+            matches!(
+                op.as_str(),
+                "==" | "!=" | "<" | "<=" | ">" | ">=" | "&&" | "||"
+            ) || expr_is_bool_expr(l)
+                || expr_is_bool_expr(r)
+        }
+        Expr::Unary(op, _) => op == "!",
+        Expr::Ternary(_, _, _) => true,
+        _ => false,
+    }
 }
 
 fn prec_of(e: &Expr) -> u8 {

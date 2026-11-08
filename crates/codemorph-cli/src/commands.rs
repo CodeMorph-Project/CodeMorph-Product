@@ -1108,61 +1108,17 @@ fn behavior_check(cpp_source: &str, rust_source: &str, cases: usize, seed: u64) 
         return (false, 0);
     }
 
-    let compile_cpp = ExecutionRequest {
-        program: "g++".to_string(),
-        args: vec![
-            "-std=c++17".into(),
-            "-O2".into(),
-            "-o".into(),
-            cpp_path.display().to_string(),
-            cpp_src.display().to_string(),
-        ],
-        cwd: None,
-        env: vec![],
-        stdin: None,
-        limits: ExecutionLimits {
-            timeout_ms: 30_000,
-            ..Default::default()
-        },
-    };
-    let compile_rust = ExecutionRequest {
-        program: "rustc".to_string(),
-        args: vec![
-            "-O".into(),
-            "-o".into(),
-            rust_path.display().to_string(),
-            rust_src.display().to_string(),
-        ],
-        cwd: None,
-        env: vec![],
-        stdin: None,
-        limits: ExecutionLimits {
-            timeout_ms: 30_000,
-            ..Default::default()
-        },
-    };
-
-    if Sandbox::execute(&compile_cpp)
-        .map(|r| r.exit_code)
-        .unwrap_or(None)
-        != Some(0)
-    {
+    let cr = CppAdapter::new().compile_text(cpp_source, "c++17", Some(cpp_path.clone()));
+    if !cr.success {
         return (false, 0);
     }
-    if Sandbox::execute(&compile_rust)
-        .map(|r| r.exit_code)
-        .unwrap_or(None)
-        != Some(0)
-    {
+    let rr = RustAdapter::new().compile_text(rust_source, Some(rust_path.clone()));
+    if !rr.success {
         return (false, 0);
     }
 
     let mut rng = SeededRng::new(seed);
     let mut passed = 0u64;
-    // Feed enough integer tokens to exercise programs that read more than two
-    // inputs (e.g. four-operand fixtures). Programs that read fewer simply
-    // ignore the remaining tokens, so a single generous shape is safe and
-    // avoids vacuous verification of multi-input programs.
     const INPUT_TOKENS: usize = 8;
     for _ in 0..cases.max(1) {
         let mut input = String::new();
@@ -1197,12 +1153,9 @@ fn behavior_check(cpp_source: &str, rust_source: &str, cases: usize, seed: u64) 
         };
         match (Sandbox::execute(&run_cpp), Sandbox::execute(&run_rust)) {
             (Ok(c), Ok(r))
-                if c.exit_code == r.exit_code
-                    && c.stdout == r.stdout
-                    && !c.timed_out
-                    && !r.timed_out =>
+                if c.exit_code == r.exit_code && c.stdout == r.stdout && !c.timed_out && !r.timed_out =>
             {
-                passed += 1
+                passed += 1;
             }
             _ => return (false, passed),
         }
