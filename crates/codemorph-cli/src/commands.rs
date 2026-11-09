@@ -103,7 +103,7 @@ fn translate_one(source_cpp: &str, out_path: &Path, allow_ollama: bool) -> FileS
                             source_cpp, rust
                         );
                         if let Ok(repaired) =
-                            generate_translation(&repair_prompt, false, allow_ollama)
+                            generate_translation(&repair_prompt, true, allow_ollama)
                         {
                             let repaired = clean_text(&repaired);
                             if compile_rust_source(&repaired).is_ok()
@@ -1016,8 +1016,7 @@ pub fn benchmark(
                 ..Default::default()
             },
         };
-        let r = Sandbox::execute(&req).unwrap();
-        cpp_times.push(r.duration_ms as f64);
+        if let Ok(r) = Sandbox::execute(&req) { cpp_times.push(r.duration_ms as f64); }
     }
     for _ in 0..iterations.max(1) {
         let req = ExecutionRequest {
@@ -1031,8 +1030,7 @@ pub fn benchmark(
                 ..Default::default()
             },
         };
-        let r = Sandbox::execute(&req).unwrap();
-        rust_times.push(r.duration_ms as f64);
+        if let Ok(r) = Sandbox::execute(&req) { rust_times.push(r.duration_ms as f64); }
     }
 
     let mean = |xs: &[f64]| xs.iter().sum::<f64>() / xs.len().max(1) as f64;

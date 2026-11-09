@@ -22,6 +22,8 @@ Options:
   over seeded inputs). Without it, results are reported as `compiled`.
 - `--use-ollama`: allow the Ollama teacher as a fallback proposer (Lab use only;
   never required).
+- Stage selection: `--stage <name>` only. The `--include-stages` / `--skip-stages`
+  options are accepted for compatibility but are not yet honored (reserved).
 - `--cases <N>`: behavior cases per file (default 20)
 - `--seed <N>`: RNG seed for behavior cases (default 7)
 

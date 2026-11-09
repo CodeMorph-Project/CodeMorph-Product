@@ -67,6 +67,12 @@ impl RustAdapter {
                 return Some(path);
             }
         }
+        // Last resort: any rustc on PATH (supports non-rustup installs).
+        if let Ok(path) = which::which("rustc") {
+            if path.exists() {
+                return Some(path);
+            }
+        }
         None
     }
 

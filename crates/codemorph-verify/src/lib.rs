@@ -82,8 +82,8 @@ impl SeededRng {
 
 pub fn build_verification_result(summary: &DifferentialSummary) -> VerificationResult {
     let mut vr = VerificationResult::new();
-    vr.cpp_compiles = true;
-    vr.rust_compiles = true;
+    vr.source_compiles = true;
+    vr.target_compiles = true;
     vr.differential_passed = summary.failed == 0 && summary.cases > 0;
     vr.tests_passed = vr.differential_passed;
     vr.confidence = if vr.differential_passed {

@@ -25,8 +25,8 @@ pub struct VerificationStage {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VerificationResult {
-    pub cpp_compiles: bool,
-    pub rust_compiles: bool,
+    pub source_compiles: bool,
+    pub target_compiles: bool,
     pub tests_passed: bool,
     pub differential_passed: bool,
     pub fuzz_iterations: u64,
@@ -42,8 +42,8 @@ pub struct VerificationResult {
 impl VerificationResult {
     pub fn new() -> Self {
         Self {
-            cpp_compiles: false,
-            rust_compiles: false,
+            source_compiles: false,
+            target_compiles: false,
             tests_passed: false,
             differential_passed: false,
             fuzz_iterations: 0,
@@ -62,7 +62,7 @@ impl VerificationResult {
     }
 
     pub fn is_accepted(&self) -> bool {
-        self.rust_compiles && self.tests_passed
+        self.target_compiles && self.tests_passed
     }
 }
 
