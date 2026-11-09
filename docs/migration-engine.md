@@ -34,3 +34,7 @@ Unsupported constructs (templates, `class`, STL containers, `string_view`,
 Each migrated file is `verified` (compiles and matches behavior), `compiled`
 (compiles, behavior unchecked), `unsupported` (outside the subset, no output
 written), or `failed` (attempted and rejected). See `docs/USAGE.md`.
+
+## Implementation status (current)
+
+The current implementation is a **CLI monolith**: streaming `migrate` in `crates/codemorph-cli/src/commands.rs`, backed by the deterministic translator in `crates/codemorph-cli/src/translate.rs`. `codemorph-orchestrate` is an in-memory state machine for job tracking only — it does *not* yet orchestrate units/budgets. Architecture split into per-language crates is tracked under `docs/decisions/` as future work (specialized-models doc).
