@@ -1,40 +1,33 @@
 # Migration Engine
 
-A C++ project is analyzed into Project IR, decomposed into migration units ordered by dependencies, translated incrementally, repaired against compiler diagnostics, tested, fuzzed, benchmarked, and assembled into a Rust crate or workspace.
+The current CLI analyzes C++ inputs and translates supported files to Rust.
+Translation uses a local CodeMorph artifact or an explicitly enabled
+[OpenAI-compatible endpoint](model-backends.md). The compiler checks each
+candidate. With `--full`, the CLI compares stdout and exit status on seeded
+inputs. Run `--stage verify` to repeat the behavioral comparison from a
+saved translation report.
 
-The engine receives a minimal relevant context for each unit. It never passes an entire large project to a model as one prompt. Budgets limit candidates, repair iterations, tokens, time, and verification work.
+## Model contract
 
-## Deterministic-first translation
+Artifacts are versioned and declare:
 
-The runtime translation path is deterministic and model-free. `translate_cpp_to_rust`
-tokenizes the input, detects unsupported constructs, parses a conservative
-subset, and emits Rust. Anything outside the subset returns
-`Unsupported(reason)` — the engine never emits partial or fabricated Rust.
+- `schema_version`, `model_version`, `training_config_version`
+- `language_pair` (currently `cpp-rust`)
+- `architecture` (`TransformerSeq2Seq-v2`)
+- `parameter_count`, tokenizer, context length and file hashes
 
-The experimental neural translator is an opt-in *proposer* only
-(`CODEMORPH_USE_MODEL=1`). Its output must still pass the same compiler and
-behavior checks. It is not the default and is not trusted on its own.
-
-## Supported subset
-
-- `#include` / `using namespace std;` / comments
-- `int main()` and free functions
-- scalar and `std::string` declarations (including `int a, b;`)
-- `std::cin >> ...` and `std::cout << ...` chains
-- full expression precedence, ternary, `++`/`--`
-- `if`/`else`, `while`, `do-while`, C-style and range `for`
-- simple `struct`s with methods and aggregate initialization
-
-Unsupported constructs (templates, `class`, STL containers, `string_view`,
-`istringstream`, `unique_ptr`, `variant`, lambdas, `operator new`,
-`reinterpret_cast`, concepts, …) are reported by name.
+The current translator is `translator-30m-v2-20261117`, a ~30m-parameter
+encoder-decoder Transformer trained on compiler-verified C++/Rust pairs.
 
 ## File statuses
 
 Each migrated file is `verified` (compiles and matches behavior), `compiled`
-(compiles, behavior unchecked), `unsupported` (outside the subset, no output
-written), or `failed` (attempted and rejected). See `docs/USAGE.md`.
+(compiles, behavior unchecked), `unsupported` (reserved for future language
+pairs), or `failed` (model candidate rejected). See `docs/USAGE.md`.
 
-## Implementation status (current)
+## Implementation status
 
-The current implementation is a **CLI monolith**: streaming `migrate` in `crates/codemorph-cli/src/commands.rs`, backed by the deterministic translator in `crates/codemorph-cli/src/translate.rs`. `codemorph-orchestrate` is an in-memory state machine for job tracking only — it does *not* yet orchestrate units/budgets. Architecture split into per-language crates is tracked under `docs/decisions/` as future work (specialized-models doc).
+The runtime is a CLI monolith in `crates/codemorph-cli/src/commands.rs`.
+`codemorph-orchestrate` remains an in-memory state machine for job tracking.
+Multi-language preparation lives in `language_pairs/` at the workspace root;
+only `cpp-rust` is active, other pairs are declared as planned.

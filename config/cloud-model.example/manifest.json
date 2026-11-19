@@ -1,0 +1,9 @@
+{
+  "schema_version": "1.0",
+  "model_id": "external/openai-chat-completions",
+  "version": "template",
+  "role": "Translator",
+  "language_pair": "cpp-rust",
+  "backend": "cloud-http",
+  "note": "Template only. Copy to a model directory and edit cloud_config.json. Requires CODEMORPH_ALLOW_EXTERNAL=1."
+}

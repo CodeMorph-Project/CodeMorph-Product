@@ -1,0 +1,19 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal --component rustfmt
+      - run: cargo +stable fmt --all --check
+      - run: docker pull rust:1-bookworm
+      - run: cargo +stable test --locked --workspace
+      - run: PYTHONPATH=python python3 -m unittest discover -s python/tests -v

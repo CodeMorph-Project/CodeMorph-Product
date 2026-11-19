@@ -54,3 +54,11 @@ Thumbs.db
 secrets/
 # Local private planning notes
 /notes/
+
+# Local migration output, environments and compiler metadata
+/outputs/
+/migration-output/
+/.venv-*/
+*.rmeta
+.env.*
+!.env.example

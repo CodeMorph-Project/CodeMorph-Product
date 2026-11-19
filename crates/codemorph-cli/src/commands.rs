@@ -1,4 +1,3 @@
-use crate::translate::{self, TranslationOutcome};
 use codemorph_core::sandbox::{ExecutionLimits, ExecutionRequest};
 use codemorph_cpp::CppAdapter;
 use codemorph_rustlang::RustAdapter;
@@ -25,6 +24,7 @@ fn find(name: &str) -> &'static str {
 enum FileStatus {
     Verified,
     Compiled,
+    #[allow(dead_code)] // kept for report-schema compatibility; neural path never emits it
     Unsupported(String),
     Failed(String),
 }
@@ -86,61 +86,27 @@ fn first_line(text: &str) -> String {
         .to_string()
 }
 
-/// Translate one C++ source file. The deterministic translator is authoritative;
-/// a neural model is only used as an opt-in proposer/repairer.
-fn translate_one(source_cpp: &str, out_path: &Path, allow_ollama: bool) -> FileStatus {
-    match translate::translate_cpp_to_rust(source_cpp) {
-        TranslationOutcome::Translated(rust) => {
-            if let Err(e) = std::fs::write(out_path, &rust) {
-                return FileStatus::Failed(format!("cannot write output: {}", e));
-            }
-            match compile_rust_source(&rust) {
-                Ok(()) => FileStatus::Compiled,
-                Err(err) => {
-                    if allow_ollama {
-                        let repair_prompt = format!(
-                            "You are repairing Rust code. Return ONLY complete valid Rust source, no markdown and no explanation. Original C++:\n```cpp\n{}\n```\nBroken Rust:\n```rust\n{}\n```",
-                            source_cpp, rust
-                        );
-                        if let Ok(repaired) =
-                            generate_translation(&repair_prompt, true, allow_ollama)
-                        {
-                            let repaired = clean_text(&repaired);
-                            if compile_rust_source(&repaired).is_ok()
-                                && std::fs::write(out_path, &repaired).is_ok()
-                            {
-                                return FileStatus::Compiled;
-                            }
-                        }
-                        FileStatus::Failed(format!(
-                            "rust compilation failed after repair: {}",
-                            first_line(&err)
-                        ))
-                    } else {
-                        FileStatus::Failed(format!("rust compilation failed: {}", first_line(&err)))
-                    }
-                }
-            }
-        }
-        TranslationOutcome::Unsupported(reason) => {
-            let use_model = std::env::var("CODEMORPH_USE_MODEL")
-                .map(|v| v == "1")
-                .unwrap_or(false);
-            if use_model {
-                if let Ok(candidate) =
-                    generate_translation(&build_translation_prompt(source_cpp), true, allow_ollama)
-                {
-                    let candidate = clean_text(&candidate);
-                    if compile_rust_source(&candidate).is_ok()
-                        && std::fs::write(out_path, &candidate).is_ok()
-                    {
-                        return FileStatus::Compiled;
-                    }
-                }
-            }
-            // Do not leave a stale or garbage .rs file for unsupported input.
+/// Translate a source file using the selected backend and compile-check the candidate.
+fn translate_one(source: &str, out_path: &Path, model_dir: Option<&Path>) -> FileStatus {
+    let candidate = match neural_translate(source, model_dir) {
+        Ok(text) => clean_text(&text),
+        Err(reason) => {
             let _ = std::fs::remove_file(out_path);
-            FileStatus::Unsupported(reason)
+            return FileStatus::Failed(reason);
+        }
+    };
+    if candidate.is_empty() {
+        let _ = std::fs::remove_file(out_path);
+        return FileStatus::Failed("model returned empty output".to_string());
+    }
+    if let Err(e) = std::fs::write(out_path, &candidate) {
+        return FileStatus::Failed(format!("cannot write output: {}", e));
+    }
+    match compile_rust_source(&candidate) {
+        Ok(()) => FileStatus::Compiled,
+        Err(err) => {
+            let _ = std::fs::remove_file(out_path);
+            FileStatus::Failed(format!("rust compilation failed: {}", first_line(&err)))
         }
     }
 }
@@ -235,7 +201,7 @@ pub fn diff_test(
                 ..Default::default()
             },
         };
-        match Sandbox::execute(&req) {
+        match codemorph_sandbox::container::execute_binary(&req) {
             Ok(res) => (res.exit_code, res.stdout, res.stderr, res.timed_out),
             Err(e) => (None, String::new(), e.to_string(), false),
         }
@@ -261,7 +227,11 @@ pub fn diff_test(
         let (rust_code, rust_outs, rust_err, rust_timeout) =
             run(rust_out.clone(), case_input.clone());
 
-        let same = !cpp_timeout && !rust_timeout && cpp_code == rust_code && cpp_outs == rust_outs;
+        let same = cpp_code.is_some()
+            && !cpp_timeout
+            && !rust_timeout
+            && cpp_code == rust_code
+            && cpp_outs == rust_outs;
         if !same {
             mismatch += 1;
             if mismatch <= 3 {
@@ -312,92 +282,154 @@ fn resolve_python() -> String {
     "python3".to_string()
 }
 
-fn generate_translation(
-    prompt: &str,
-    allow_local: bool,
-    allow_ollama: bool,
-) -> Result<String, String> {
-    let models_root = resolve_models_root();
-    let translator_dir = std::path::PathBuf::from(&models_root).join("translator");
-    let manifest_path = translator_dir.join("manifest.json");
-    if allow_local && manifest_path.exists() {
-        let manifest = std::fs::read_to_string(&manifest_path).unwrap_or_default();
-        if manifest.contains("python-torch") {
-            let python = resolve_python();
-            let mut pythonpath = resolve_pythonpath();
-            if !std::path::Path::new(&pythonpath).exists() {
-                pythonpath = ".".to_string();
-            }
-            let env = vec![("PYTHONPATH".to_string(), pythonpath)];
-            use codemorph_core::sandbox::{ExecutionLimits, ExecutionRequest};
-            use codemorph_sandbox::Sandbox;
-            let req = ExecutionRequest {
-                program: python.clone(),
-                args: vec![
-                    "-m".to_string(),
-                    "codemorph_ml.inference".to_string(),
-                    "--model-dir".to_string(),
-                    translator_dir.display().to_string(),
-                    "--source-text".to_string(),
-                    prompt.to_string(),
-                ],
-                cwd: None,
-                env: env.clone(),
-                stdin: None,
-                limits: ExecutionLimits {
-                    timeout_ms: 300_000,
-                    ..Default::default()
-                },
-            };
-            let res = Sandbox::execute(&req).map_err(|e| e.to_string())?;
-            if res.timed_out {
-                return Err("python inference timeout".to_string());
-            }
-            if res.exit_code != Some(0) {
-                eprintln!("python inference stderr: {}", res.stderr);
-                return Err(res.stderr);
-            }
-            return Ok(res.stdout);
-        }
+/// Resolve an explicit translator profile or discover an installed translator.
+fn resolve_translator_dir(explicit: Option<&Path>) -> Result<PathBuf, String> {
+    if let Some(path) = explicit {
+        return Ok(path.to_path_buf());
     }
-
-    if !allow_ollama {
-        return Err("Local model unavailable and Ollama assistance is disabled".to_string());
+    let root = PathBuf::from(resolve_models_root());
+    let preferred = root.join("translator");
+    if preferred.join("manifest.json").exists() {
+        return Ok(preferred);
     }
-    let model =
-        std::env::var("CODEMORPH_OLLAMA_MODEL").unwrap_or_else(|_| "beam:cloud".to_string());
-    python_ollama_generate(&model, prompt)
+    let mut candidates: Vec<PathBuf> = std::fs::read_dir(&root)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.is_dir()
+                        && p.file_name()
+                            .and_then(|n| n.to_str())
+                            .map(|n| n.starts_with("translator-"))
+                            .unwrap_or(false)
+                        && p.join("manifest.json").exists()
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    candidates.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+    candidates
+        .into_iter()
+        .next()
+        .ok_or_else(|| "no local translator artifact found (use --model-dir)".to_string())
 }
 
-fn selected_translation_backend() -> String {
-    let use_model = std::env::var("CODEMORPH_USE_MODEL")
-        .map(|v| v == "1")
-        .unwrap_or(false);
-    if !use_model {
-        return "deterministic verified translator".to_string();
+/// Run the selected translator backend on raw source code.
+fn neural_translate(source: &str, model_dir: Option<&Path>) -> Result<String, String> {
+    let translator_dir = resolve_translator_dir(model_dir)?;
+    let manifest_path = translator_dir.join("manifest.json");
+    if !manifest_path.exists() {
+        return Err(format!(
+            "model artifact missing manifest: {}",
+            manifest_path.display()
+        ));
     }
-    let models_root = resolve_models_root();
-    let manifest_path = PathBuf::from(&models_root)
-        .join("translator")
-        .join("manifest.json");
-    let local_disabled = std::env::var("CODEMORPH_USE_LOCAL_MODEL").unwrap_or_default() == "0";
-    if !local_disabled && manifest_path.exists() {
-        let manifest = std::fs::read_to_string(&manifest_path).unwrap_or_default();
-        if manifest.contains("python-torch") {
-            let model_id = serde_json::from_str::<serde_json::Value>(&manifest)
-                .ok()
-                .and_then(|v| {
-                    v.get("model_id")
-                        .and_then(|x| x.as_str())
-                        .map(str::to_string)
-                })
-                .unwrap_or_else(|| "local-torch".to_string());
-            return format!("local trained model ({})", model_id);
+    let manifest_text = std::fs::read_to_string(&manifest_path)
+        .map_err(|e| format!("cannot read {}: {e}", manifest_path.display()))?;
+    let manifest_json: serde_json::Value = serde_json::from_str(&manifest_text)
+        .map_err(|e| format!("invalid {}: {e}", manifest_path.display()))?;
+    if !manifest_json.is_object() {
+        return Err(format!("expected an object in {}", manifest_path.display()));
+    }
+    let backend = manifest_json
+        .get("backend")
+        .and_then(|v| v.as_str())
+        .unwrap_or("python-torch");
+    let mut pythonpath = resolve_pythonpath();
+    if !std::path::Path::new(&pythonpath).exists() {
+        pythonpath = ".".to_string();
+    }
+    if backend == "cloud-http" {
+        if std::env::var("CODEMORPH_ALLOW_EXTERNAL").as_deref() != Ok("1") {
+            return Err("external model backend requires CODEMORPH_ALLOW_EXTERNAL=1".to_string());
         }
+        let req = ExecutionRequest {
+            program: std::env::var("CODEMORPH_PYTHON").unwrap_or_else(|_| "python3".into()),
+            args: vec![
+                "-m".to_string(),
+                "codemorph_ml.cloud_inference".to_string(),
+                "--model-dir".to_string(),
+                translator_dir.display().to_string(),
+            ],
+            cwd: None,
+            env: vec![("PYTHONPATH".to_string(), pythonpath)],
+            stdin: Some(source.to_owned()),
+            limits: ExecutionLimits {
+                timeout_ms: 600_000,
+                ..Default::default()
+            },
+        };
+        let res = Sandbox::execute(&req).map_err(|e| e.to_string())?;
+        if res.timed_out {
+            return Err("external model inference timeout".to_string());
+        }
+        if res.exit_code != Some(0) {
+            return Err(format!(
+                "external model inference failed: {}",
+                first_line(&res.stderr)
+            ));
+        }
+        return Ok(res.stdout);
     }
-    let model =
-        std::env::var("CODEMORPH_OLLAMA_MODEL").unwrap_or_else(|_| "beam:cloud".to_string());
-    format!("Ollama teacher ({})", model)
+    if backend != "python-torch" {
+        return Err(format!(
+            "unsupported model backend in {}",
+            manifest_path.display()
+        ));
+    }
+    let req = ExecutionRequest {
+        program: resolve_python(),
+        args: vec![
+            "-m".to_string(),
+            "codemorph_ml.inference".to_string(),
+            "--model-dir".to_string(),
+            translator_dir.display().to_string(),
+            "--source-text".to_string(),
+            source.to_string(),
+        ],
+        cwd: None,
+        env: vec![("PYTHONPATH".to_string(), pythonpath)],
+        stdin: None,
+        limits: ExecutionLimits {
+            timeout_ms: 300_000,
+            ..Default::default()
+        },
+    };
+    let res = Sandbox::execute(&req).map_err(|e| e.to_string())?;
+    if res.timed_out {
+        return Err("local model inference timeout".to_string());
+    }
+    if res.exit_code != Some(0) {
+        return Err(format!(
+            "local model inference failed: {}",
+            first_line(&res.stderr)
+        ));
+    }
+    Ok(res.stdout)
+}
+
+fn selected_translation_backend(model_dir: Option<&Path>) -> String {
+    match resolve_translator_dir(model_dir).ok().and_then(|dir| {
+        let text = std::fs::read_to_string(dir.join("manifest.json")).ok()?;
+        let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+        let id = json
+            .get("model_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("model")
+            .to_string();
+        let backend = json
+            .get("backend")
+            .and_then(|v| v.as_str())
+            .unwrap_or("python-torch");
+        Some((id, backend.to_string()))
+    }) {
+        Some((id, backend)) if backend == "cloud-http" => {
+            format!("EXTERNAL neural model ({id}) [opt-in required]")
+        }
+        Some((id, _)) => format!("local neural model ({id})"),
+        None => "local neural model (not installed)".to_string(),
+    }
 }
 
 fn resolve_models_root() -> String {
@@ -451,6 +483,14 @@ fn resolve_pythonpath() -> String {
             return value;
         }
     }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(bin_dir) = exe.parent() {
+            let installed = bin_dir.join("../share/codemorph/python");
+            if installed.join("codemorph_ml/inference.py").is_file() {
+                return installed.display().to_string();
+            }
+        }
+    }
     let cwd = std::path::PathBuf::from("python");
     if cwd.join("codemorph_ml").join("inference.py").exists() {
         return cwd.display().to_string();
@@ -466,13 +506,42 @@ fn resolve_pythonpath() -> String {
     ".".to_string()
 }
 
+fn create_migration_dir(path: &Path) {
+    if let Err(error) = std::fs::create_dir_all(path) {
+        eprintln!("cannot create {}: {error}", path.display());
+        std::process::exit(1);
+    }
+}
+
+fn write_migration_artifact(path: impl AsRef<Path>, value: &impl serde::Serialize) {
+    use std::io::Write;
+
+    let path = path.as_ref();
+    let result = (|| -> anyhow::Result<()> {
+        let parent = path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("artifact path has no parent"))?;
+        let mut file = tempfile::NamedTempFile::new_in(parent)?;
+        serde_json::to_writer_pretty(&mut file, value)?;
+        writeln!(file)?;
+        file.persist(path)?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        eprintln!("cannot save {}: {error}", path.display());
+        std::process::exit(1);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn migrate(
     input: PathBuf,
     output: PathBuf,
     stage: String,
     full: bool,
-    use_ollama: bool,
+    source_lang: String,
+    target_lang: String,
+    model_dir: Option<PathBuf>,
     cases: usize,
     seed: u64,
     include_stages: Option<String>,
@@ -481,31 +550,36 @@ pub fn migrate(
     let _ = include_stages;
     let _ = skip_stages;
 
-    let allow_ollama = use_ollama
-        || std::env::var("CODEMORPH_USE_OLLAMA")
-            .map(|v| v == "1")
-            .unwrap_or(false);
-
-    std::fs::create_dir_all(&output).ok();
+    if source_lang != "cpp" || target_lang != "rust" {
+        eprintln!(
+            "language pair {source_lang}->{target_lang} is not active yet; only cpp->rust is available"
+        );
+        std::process::exit(2);
+    }
+    if !input.exists() {
+        eprintln!("input does not exist: {}", input.display());
+        std::process::exit(2);
+    }
+    if cases == 0 {
+        eprintln!("--cases must be greater than zero");
+        std::process::exit(2);
+    }
+    let model_ref = model_dir.as_deref();
     let codemorph_dir = output.join(".codemorph");
     let stage_dir = codemorph_dir.join("stages");
-    std::fs::create_dir_all(&stage_dir).ok();
+    create_migration_dir(&stage_dir);
 
     match stage.as_str() {
         "analyze" => {
             let ir = codemorph_project::analyze(&input);
             let path = codemorph_dir.join("project_ir.json");
-            let _ = std::fs::write(&path, serde_json::to_string_pretty(&ir).unwrap_or_default());
+            write_migration_artifact(&path, &ir);
             println!("analyzed files: {}", ir.files.len());
             println!("artifact: {}", path.display());
             println!("status: analyze complete");
             return;
         }
         "translate" => {
-            if !input.exists() {
-                eprintln!("input does not exist");
-                return;
-            }
             let source_files = collect_source_files(&input);
             let mut summary = Vec::new();
             let mut verified = 0usize;
@@ -526,7 +600,7 @@ pub fn migrate(
                 };
                 let out_path = output.join(rel.with_extension("rs"));
                 if let Some(p) = out_path.parent() {
-                    std::fs::create_dir_all(p).ok();
+                    create_migration_dir(p);
                 }
                 let source_cpp = match std::fs::read_to_string(source_path) {
                     Ok(s) => s,
@@ -536,7 +610,7 @@ pub fn migrate(
                         continue;
                     }
                 };
-                let status = translate_one(&source_cpp, &out_path, allow_ollama);
+                let status = translate_one(&source_cpp, &out_path, model_ref);
                 match &status {
                     FileStatus::Verified => verified += 1,
                     FileStatus::Compiled => compiled += 1,
@@ -555,10 +629,7 @@ pub fn migrate(
                 }));
             }
             let path = stage_dir.join("translate.json");
-            let _ = std::fs::write(
-                &path,
-                serde_json::to_string_pretty(&summary).unwrap_or_default(),
-            );
+            write_migration_artifact(&path, &summary);
             println!("translated artifacts: {}", summary.len());
             println!("artifact: {}", path.display());
             print_summary(verified, compiled, unsupported, failed, source_files.len());
@@ -569,18 +640,50 @@ pub fn migrate(
             let mut results = Vec::new();
             for rust_path in &collect_rust_files(&output) {
                 let source = std::fs::read_to_string(rust_path).unwrap_or_default();
-                let compiled = write_and_check_rust(rust_path, &source);
-                if compiled {
-                    results.push(serde_json::json!({ "file": rust_path.display().to_string(), "compiled": true, "status": "already valid" }));
-                } else {
-                    results.push(serde_json::json!({ "file": rust_path.display().to_string(), "compiled": false, "status": "needs repair" }));
+                if source.trim().is_empty() {
+                    continue;
+                }
+                let original_compiles = write_and_check_rust(rust_path, &source);
+                match role_model_generate(
+                    "repair",
+                    &format!(
+                        "Repair this Rust source and return complete valid Rust code only.\n{}",
+                        source
+                    ),
+                ) {
+                    Ok(candidate) => {
+                        let candidate = clean_text(&candidate);
+                        let candidate_path = rust_path.with_extension("repair.rs");
+                        let candidate_compiles = write_and_check_rust(&candidate_path, &candidate);
+                        let behavior_ok = matching_cpp_for_rust(&input, rust_path.as_path())
+                            .and_then(|cpp| std::fs::read_to_string(cpp).ok())
+                            .map(|cpp| behavior_check(&cpp, &candidate, cases, seed).0)
+                            .unwrap_or(false);
+                        let accepted = candidate_compiles && behavior_ok;
+                        if accepted {
+                            let backup = rust_path.with_extension("rs.orig");
+                            let _ = std::fs::copy(rust_path, &backup);
+                            let _ = std::fs::write(rust_path, &candidate);
+                        }
+                        results.push(serde_json::json!({
+                            "file": rust_path.display().to_string(),
+                            "original_compiles": original_compiles,
+                            "candidate": candidate_path.display().to_string(),
+                            "candidate_compiles": candidate_compiles,
+                            "behavior_verified": behavior_ok,
+                            "accepted": accepted,
+                            "status": if accepted { "candidate accepted" } else { "candidate rejected" },
+                        }));
+                    }
+                    Err(e) => results.push(serde_json::json!({
+                        "file": rust_path.display().to_string(),
+                        "original_compiles": original_compiles,
+                        "status": e,
+                    })),
                 }
             }
             let path = stage_dir.join("repair.json");
-            let _ = std::fs::write(
-                &path,
-                serde_json::to_string_pretty(&results).unwrap_or_default(),
-            );
+            write_migration_artifact(&path, &results);
             println!("repair stage complete: {} files scanned", results.len());
             println!("artifact: {}", path.display());
             return;
@@ -598,10 +701,7 @@ pub fn migrate(
                 }
             }
             let path = stage_dir.join("ownership.json");
-            let _ = std::fs::write(
-                &path,
-                serde_json::to_string_pretty(&reports).unwrap_or_default(),
-            );
+            write_migration_artifact(&path, &reports);
             println!(
                 "ownership stage: {} files, artifact {}",
                 reports.len(),
@@ -617,19 +717,34 @@ pub fn migrate(
                     continue;
                 }
                 match role_model_generate("idiomatizer", &format!("Rewrite Rust more idiomatically while preserving behavior. Return code only.\n{}", source)) {
-                    Ok(candidate) => {
-                        let candidate = clean_text(&candidate);
-                        let ok = write_and_check_rust(&rust_path.with_extension("idiom.rs"), &candidate);
-                        reports.push(serde_json::json!({ "file": rust_path.display().to_string(), "status": if ok { "candidate valid" } else { "candidate invalid" } }));
+                Ok(candidate) => {
+                    let candidate = clean_text(&candidate);
+                    let ok = write_and_check_rust(&rust_path.with_extension("idiom.rs"), &candidate);
+                    let behavior_ok = matching_cpp_for_rust(&input, &rust_path)
+                        .and_then(|cpp| std::fs::read_to_string(cpp).ok())
+                        .map(|cpp| behavior_check(&cpp, &candidate, cases, seed).0)
+                        .unwrap_or(false);
+                    let accepted = ok && behavior_ok;
+                    if accepted {
+                        let backup = rust_path.with_extension("rs.orig");
+                        if !backup.exists() {
+                            let _ = std::fs::copy(&rust_path, &backup);
+                        }
+                        let _ = std::fs::write(&rust_path, &candidate);
                     }
+                    reports.push(serde_json::json!({
+                        "file": rust_path.display().to_string(),
+                        "candidate_compiles": ok,
+                        "behavior_verified": behavior_ok,
+                        "accepted": accepted,
+                        "status": if accepted { "candidate accepted" } else { "candidate rejected" },
+                    }));
+                }
                     Err(e) => reports.push(serde_json::json!({ "file": rust_path.display().to_string(), "status": e })),
                 }
             }
             let path = stage_dir.join("idiomatize.json");
-            let _ = std::fs::write(
-                &path,
-                serde_json::to_string_pretty(&reports).unwrap_or_default(),
-            );
+            write_migration_artifact(&path, &reports);
             println!(
                 "idiomatize stage: {} files, artifact {}",
                 reports.len(),
@@ -637,45 +752,114 @@ pub fn migrate(
             );
             return;
         }
-        "verify" => {
-            let manifest_path = output.join(".codemorph").join("migration-report.json");
-            if let Ok(text) = std::fs::read_to_string(&manifest_path) {
-                if let Ok(jsonv) = serde_json::from_str::<serde_json::Value>(&text) {
-                    if let Some(files) = jsonv.get("files").and_then(|v| v.as_array()) {
-                        let mut ok = 0;
-                        for f in files {
-                            let src = f.get("source").and_then(|v| v.as_str()).map(PathBuf::from);
-                            let out = f.get("output").and_then(|v| v.as_str()).map(PathBuf::from);
-                            if let (Some(src), Some(outp)) = (src, out) {
-                                let source_cpp = std::fs::read_to_string(&src).unwrap_or_default();
-                                let generated = std::fs::read_to_string(&outp).unwrap_or_default();
-                                let (pass, _count) =
-                                    behavior_check(&source_cpp, &generated, cases, seed);
-                                println!(
-                                    "  {} -> {}",
-                                    src.display(),
-                                    if pass { "OK" } else { "MISMATCH" }
-                                );
-                                if pass {
-                                    ok += 1;
-                                }
-                            }
-                        }
-                        println!("verified: {}/{}", ok, files.len());
-                    }
+        "planner" | "performance" | "security" => {
+            let role = stage.as_str();
+            let prompt_prefix = match role {
+                "planner" => "Produce a concise migration plan for this C++ source. Return plain text only.",
+                "performance" => "Suggest performance risks and budget notes for this C++ source. Return plain text only.",
+                _ => "List security-relevant constructs and risks in this C++ source. Return plain text only.",
+            };
+            let mut reports = Vec::new();
+            for source_path in collect_cpp_files(&input) {
+                let source = std::fs::read_to_string(&source_path).unwrap_or_default();
+                if source.trim().is_empty() {
+                    continue;
                 }
+                let prompt = format!("{}\n{}", prompt_prefix, source);
+                match role_model_generate(role, &prompt) {
+                    Ok(resp) => reports.push(serde_json::json!({
+                        "file": source_path.display().to_string(),
+                        "status": "model-checked",
+                        "note": clean_text(&resp),
+                    })),
+                    Err(e) => reports.push(serde_json::json!({
+                        "file": source_path.display().to_string(),
+                        "status": e,
+                    })),
+                }
+            }
+            let path = stage_dir.join(format!("{}.json", role));
+            write_migration_artifact(&path, &reports);
+            println!(
+                "{} stage: {} files, artifact {}",
+                role,
+                reports.len(),
+                path.display()
+            );
+            return;
+        }
+        "verify" => {
+            let manifest_path = codemorph_dir.join("migration-report.json");
+            let translate_path = stage_dir.join("translate.json");
+            let report_path = if translate_path.exists() {
+                &translate_path
             } else {
-                eprintln!(
-                    "Run migrate --stage all or translate first to produce migration-report.json"
-                );
+                &manifest_path
+            };
+            let files = std::fs::read_to_string(report_path)
+                .map_err(anyhow::Error::from)
+                .and_then(|text| Ok(serde_json::from_str::<serde_json::Value>(&text)?))
+                .and_then(|report| {
+                    report
+                        .as_array()
+                        .or_else(|| report.get("files").and_then(|files| files.as_array()))
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!("expected an array of files"))
+                })
+                .unwrap_or_else(|error| {
+                    eprintln!("cannot read {}: {error}", report_path.display());
+                    std::process::exit(1);
+                });
+            let mut results = Vec::new();
+            for file in &files {
+                let (Some(source), Some(candidate)) = (
+                    file.get("source").and_then(|v| v.as_str()),
+                    file.get("output")
+                        .or_else(|| file.get("translation"))
+                        .and_then(|v| v.as_str()),
+                ) else {
+                    continue;
+                };
+                if file.get("status").and_then(|v| v.as_str()) == Some("failed") {
+                    continue;
+                }
+                let (pass, count, reason) = match (
+                    std::fs::read_to_string(source),
+                    std::fs::read_to_string(candidate),
+                ) {
+                    (Ok(cpp), Ok(rust)) => {
+                        let (pass, count) = behavior_check(&cpp, &rust, cases, seed);
+                        (pass, count, None)
+                    }
+                    (Err(error), _) => (false, 0, Some(format!("cannot read {source}: {error}"))),
+                    (_, Err(error)) => {
+                        (false, 0, Some(format!("cannot read {candidate}: {error}")))
+                    }
+                };
+                println!("  {source} -> {}", if pass { "OK" } else { "FAILED" });
+                results.push(serde_json::json!({
+                    "source": source,
+                    "output": candidate,
+                    "behavior_verified": pass,
+                    "behavior_passed_inputs": count,
+                    "behavior_total_inputs": cases,
+                    "reason": reason,
+                }));
+            }
+            let passed = results
+                .iter()
+                .filter(|entry| entry["behavior_verified"] == true)
+                .count();
+            let artifact = stage_dir.join("verify.json");
+            write_migration_artifact(&artifact, &results);
+            println!("verified: {passed}/{}", results.len());
+            println!("artifact: {}", artifact.display());
+            if results.is_empty() || passed != results.len() {
+                std::process::exit(1);
             }
             return;
         }
         "ffi" => {
-            if !input.exists() {
-                eprintln!("input does not exist");
-                return;
-            }
             let mut sources = Vec::new();
             if input.is_file() {
                 sources.push(input.clone());
@@ -684,9 +868,8 @@ pub fn migrate(
                     .into_iter()
                     .for_each(|p| sources.push(p));
             }
-            std::fs::create_dir_all(&output).ok();
             let ffi_dir = output.join("ffi");
-            std::fs::create_dir_all(&ffi_dir).ok();
+            create_migration_dir(&ffi_dir);
             let mut count = 0usize;
             let mut manifest = Vec::new();
             for source_path in &sources {
@@ -706,11 +889,7 @@ pub fn migrate(
                 }));
             }
             let path = output.join(".codemorph").join("stages").join("ffi.json");
-            std::fs::create_dir_all(output.join(".codemorph").join("stages")).ok();
-            let _ = std::fs::write(
-                &path,
-                serde_json::to_string_pretty(&manifest).unwrap_or_default(),
-            );
+            write_migration_artifact(&path, &manifest);
             println!("ffi stage: {} modules scaffolded", count);
             println!("artifact: {}", path.display());
             println!("status: ffi scaffold generated (manual review required)");
@@ -719,11 +898,7 @@ pub fn migrate(
         _ => {}
     }
 
-    println!("Analyzing {}", input.display());
-    if !input.exists() {
-        eprintln!("input does not exist");
-        return;
-    }
+    eprintln!("[analyze] {}", input.display());
 
     let ir = codemorph_project::analyze(&input);
     println!("analyzed files: {}", ir.files.len());
@@ -735,13 +910,12 @@ pub fn migrate(
         println!("  {}: {}", lang, n);
     }
 
-    std::fs::create_dir_all(&output).ok();
     let source_files = collect_source_files(&input);
     let source_files_is_empty = source_files.is_empty();
 
     println!(
         "translator backend selected: {}",
-        selected_translation_backend()
+        selected_translation_backend(model_ref)
     );
 
     struct FileResult {
@@ -754,7 +928,7 @@ pub fn migrate(
     }
 
     let mut results: Vec<FileResult> = Vec::new();
-    for source_path in &source_files {
+    for (index, source_path) in source_files.iter().enumerate() {
         let rel = if input.is_dir() {
             source_path
                 .strip_prefix(&input)
@@ -768,7 +942,7 @@ pub fn migrate(
         };
         let out_path = output.join(rel.with_extension("rs"));
         if let Some(parent) = out_path.parent() {
-            std::fs::create_dir_all(parent).ok();
+            create_migration_dir(parent);
         }
 
         let source_cpp = match std::fs::read_to_string(source_path) {
@@ -787,8 +961,13 @@ pub fn migrate(
             }
         };
 
-        print!("translating {} ... ", source_path.display());
-        let status = translate_one(&source_cpp, &out_path, allow_ollama);
+        eprintln!(
+            "[translate {}/{}] {}",
+            index + 1,
+            source_files.len(),
+            source_path.display()
+        );
+        let status = translate_one(&source_cpp, &out_path, model_ref);
         match &status {
             FileStatus::Verified => println!("verified"),
             FileStatus::Compiled => println!("compiled"),
@@ -810,7 +989,7 @@ pub fn migrate(
     }
 
     if full {
-        println!("Behavior verification stage: {} cases per file", cases);
+        eprintln!("[verify] {cases} cases per file, seed {seed}");
         for r in results.iter_mut() {
             if !matches!(r.status, FileStatus::Compiled) {
                 continue;
@@ -878,7 +1057,6 @@ pub fn migrate(
         .collect();
 
     let stage_dir = output.join(".codemorph").join("stages");
-    let _ = std::fs::create_dir_all(&stage_dir);
     let translate_summary: Vec<serde_json::Value> = results
         .iter()
         .map(|r| {
@@ -902,17 +1080,13 @@ pub fn migrate(
             })
         })
         .collect();
-    let _ = std::fs::write(
-        stage_dir.join("translate.json"),
-        serde_json::to_string_pretty(&translate_summary).unwrap_or_default(),
-    );
-    let _ = std::fs::write(stage_dir.join("repair.json"), "[]");
-    let _ = std::fs::write(
-        stage_dir.join("verify.json"),
-        serde_json::to_string_pretty(&verify_summary).unwrap_or_default(),
-    );
+    write_migration_artifact(stage_dir.join("translate.json"), &translate_summary);
+    write_migration_artifact(stage_dir.join("verify.json"), &verify_summary);
 
     let report = serde_json::json!({
+        "schema_version": 1,
+        "backend": selected_translation_backend(model_ref),
+        "behavior_check": full.then_some(serde_json::json!({"cases": cases, "seed": seed})),
         "input": input.display().to_string(),
         "output": output.display().to_string(),
         "verified": verified,
@@ -922,12 +1096,8 @@ pub fn migrate(
         "total": results.len(),
         "files": manifest,
     });
-    std::fs::create_dir_all(output.join(".codemorph")).ok();
     let report_path = output.join(".codemorph").join("migration-report.json");
-    let _ = std::fs::write(
-        &report_path,
-        serde_json::to_string_pretty(&report).unwrap_or_default(),
-    );
+    write_migration_artifact(&report_path, &report);
 
     print_summary(verified, compiled, unsupported, failed, results.len());
     println!("report: {}", report_path.display());
@@ -1016,7 +1186,9 @@ pub fn benchmark(
                 ..Default::default()
             },
         };
-        if let Ok(r) = Sandbox::execute(&req) { cpp_times.push(r.duration_ms as f64); }
+        if let Ok(r) = codemorph_sandbox::container::execute_binary(&req) {
+            cpp_times.push(r.duration_ms as f64);
+        }
     }
     for _ in 0..iterations.max(1) {
         let req = ExecutionRequest {
@@ -1030,7 +1202,9 @@ pub fn benchmark(
                 ..Default::default()
             },
         };
-        if let Ok(r) = Sandbox::execute(&req) { rust_times.push(r.duration_ms as f64); }
+        if let Ok(r) = codemorph_sandbox::container::execute_binary(&req) {
+            rust_times.push(r.duration_ms as f64);
+        }
     }
 
     let mean = |xs: &[f64]| xs.iter().sum::<f64>() / xs.len().max(1) as f64;
@@ -1045,13 +1219,6 @@ pub fn benchmark(
     println!("cpp_mean_ms: {:.3}", cpp_mean);
     println!("rust_mean_ms: {:.3}", rust_mean);
     println!("rust_over_cpp_ratio: {:.3}", ratio);
-}
-
-fn build_translation_prompt(source_cpp: &str) -> String {
-    format!(
-        "Translate the following C/C++ code into a complete Rust program. Preserve behavior, signatures, and main when present. Return only Rust code, no markdown, no explanation.\n\n{}",
-        source_cpp
-    )
 }
 
 fn clean_text(text: &str) -> String {
@@ -1073,54 +1240,6 @@ fn clean_text(text: &str) -> String {
     lines.join("\n").trim().to_string()
 }
 
-fn python_ollama_generate(model: &str, prompt: &str) -> Result<String, String> {
-    use codemorph_core::sandbox::{ExecutionLimits, ExecutionRequest};
-    use codemorph_sandbox::Sandbox;
-
-    let python = std::env::var("CODEMORPH_PYTHON").unwrap_or_else(|_| "python3".to_string());
-    let mut pythonpath = resolve_pythonpath();
-    if !std::path::Path::new(&pythonpath).exists() {
-        pythonpath = ".".to_string();
-    }
-
-    let script = r#"
-import os, sys
-os.environ.setdefault("CODEMORPH_OLLAMA_HOST", "http://localhost:11434")
-os.environ.setdefault("CODEMORPH_TEACHER_MODEL", sys.argv[1])
-sys.path.insert(0, os.environ.get("PYTHONPATH", "."))
-from codemorph_ml.ollama_client import OllamaTeacher
-teacher = OllamaTeacher(OllamaTeacher.from_env())
-prompt = sys.stdin.read()
-candidates = teacher.generate_candidates(prompt, candidate_count=1)
-print(candidates[0].text, end="")
-"#
-    .to_string();
-
-    let env = vec![("PYTHONPATH".to_string(), pythonpath)];
-    let req = ExecutionRequest {
-        program: python.clone(),
-        args: vec!["-c".to_string(), script, model.to_string()],
-        cwd: None,
-        env,
-        stdin: Some(prompt.to_string()),
-        limits: ExecutionLimits {
-            timeout_ms: 300_000,
-            ..Default::default()
-        },
-    };
-    let res = Sandbox::execute(&req).map_err(|e| e.to_string())?;
-    if res.timed_out {
-        return Err("python ollama timeout".to_string());
-    }
-    if res.exit_code != Some(0) {
-        return Err(res.stderr);
-    }
-    if res.stdout.trim().is_empty() {
-        return Err(format!("empty result; stderr={}", res.stderr));
-    }
-    Ok(res.stdout)
-}
-
 fn write_and_check_rust(path: &std::path::Path, source: &str) -> bool {
     if std::fs::write(path, source).is_err() {
         return false;
@@ -1132,7 +1251,7 @@ fn write_and_check_rust(path: &std::path::Path, source: &str) -> bool {
 
 fn behavior_check(cpp_source: &str, rust_source: &str, cases: usize, seed: u64) -> (bool, u64) {
     use codemorph_core::sandbox::{ExecutionLimits, ExecutionRequest};
-    use codemorph_sandbox::Sandbox;
+    use codemorph_sandbox::container::execute_binary;
     use codemorph_verify::SeededRng;
     use tempfile::TempDir;
 
@@ -1194,9 +1313,10 @@ fn behavior_check(cpp_source: &str, rust_source: &str, cases: usize, seed: u64) 
                 ..Default::default()
             },
         };
-        match (Sandbox::execute(&run_cpp), Sandbox::execute(&run_rust)) {
+        match (execute_binary(&run_cpp), execute_binary(&run_rust)) {
             (Ok(c), Ok(r))
-                if c.exit_code == r.exit_code
+                if c.exit_code.is_some()
+                    && c.exit_code == r.exit_code
                     && c.stdout == r.stdout
                     && !c.timed_out
                     && !r.timed_out =>
@@ -1218,6 +1338,10 @@ fn collect_rust_files(root: &std::path::PathBuf) -> Vec<std::path::PathBuf> {
                 if p.is_dir() {
                     walk(&p, out);
                 } else if p.extension().and_then(|x| x.to_str()) == Some("rs") {
+                    let name = p.file_name().and_then(|x| x.to_str()).unwrap_or_default();
+                    if name.ends_with(".repair.rs") || name.ends_with(".idiom.rs") {
+                        continue;
+                    }
                     out.push(p);
                 }
             }
@@ -1226,6 +1350,13 @@ fn collect_rust_files(root: &std::path::PathBuf) -> Vec<std::path::PathBuf> {
     walk(root, &mut out);
     out.sort();
     out
+}
+
+fn matching_cpp_for_rust(input: &PathBuf, rust_path: &Path) -> Option<PathBuf> {
+    let stem = rust_path.file_stem()?.to_str()?;
+    collect_cpp_files(input)
+        .into_iter()
+        .find(|p| p.file_stem().and_then(|s| s.to_str()) == Some(stem))
 }
 
 fn ffi_rust_type(cpp: &str) -> String {
@@ -1345,13 +1476,16 @@ fn collect_cpp_files(root: &PathBuf) -> Vec<PathBuf> {
     fn walk(dir: &PathBuf, out: &mut Vec<PathBuf>) {
         if let Ok(read) = std::fs::read_dir(dir) {
             for entry in read.flatten() {
+                let Ok(kind) = entry.file_type() else {
+                    continue;
+                };
                 let p = entry.path();
-                if p.is_dir() {
+                if kind.is_dir() {
                     walk(&p, out);
-                } else if let Some(ext) = p.extension().and_then(|x| x.to_str()) {
-                    if matches!(ext, "cpp" | "cc" | "cxx" | "c" | "h" | "hpp") {
-                        out.push(p);
-                    }
+                } else if kind.is_file()
+                    && matches!(codemorph_project::detect_language(&p), Some("c" | "cpp"))
+                {
+                    out.push(p);
                 }
             }
         }
@@ -1362,9 +1496,7 @@ fn collect_cpp_files(root: &PathBuf) -> Vec<PathBuf> {
 }
 
 fn role_model_generate(role: &str, prompt: &str) -> Result<String, String> {
-    let models_root =
-        std::env::var("CODEMORPH_MODELS_ROOT").unwrap_or_else(|_| "models".to_string());
-    let model_dir = PathBuf::from(models_root).join(role);
+    let model_dir = PathBuf::from(resolve_models_root()).join(role);
     let manifest_path = model_dir.join("manifest.json");
     if !manifest_path.exists() {
         return Err(format!("model missing for {}", role));
@@ -1374,11 +1506,7 @@ fn role_model_generate(role: &str, prompt: &str) -> Result<String, String> {
         return Err(format!("unsupported backend for {}", role));
     }
     let python = resolve_python();
-    let mut pythonpath =
-        std::env::var("CODEMORPH_PYTHONPATH").unwrap_or_else(|_| "python".to_string());
-    if !std::path::Path::new(&pythonpath).exists() {
-        pythonpath = ".".to_string();
-    }
+    let pythonpath = resolve_pythonpath();
     use codemorph_core::sandbox::{ExecutionLimits, ExecutionRequest};
     use codemorph_sandbox::Sandbox;
     let req = ExecutionRequest {

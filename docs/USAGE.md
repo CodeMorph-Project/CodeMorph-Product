@@ -14,14 +14,14 @@ Stages:
 - `--stage analyze`: writes `.codemorph/project_ir.json` and stops
 - `--stage translate`: translates and compile-checks only; writes `.codemorph/stages/translate.json`
 - `--stage repair`: re-checks existing Rust outputs
-- `--stage verify`: behavior-compares an existing `migration-report.json`
+- `--stage verify`: compares behavior using `migration-report.json` or `stages/translate.json` and writes `stages/verify.json`
 - `--stage ownership`, `--stage idiomatize`: optional model-assisted reports
 
 Options:
 - `--full`: run behavior verification (compiles C++ and Rust, compares stdout
   over seeded inputs). Without it, results are reported as `compiled`.
-- `--use-ollama`: allow the Ollama teacher as a fallback proposer (Lab use only;
-  never required).
+- `--model-dir <path>`: translator profile to use. See [model setup](model-backends.md).
+- `--source-lang` / `--target-lang`: language pair. Only `cpp`→`rust` is active.
 - Stage selection: `--stage <name>` only. The `--include-stages` / `--skip-stages`
   options are accepted for compatibility but are not yet honored (reserved).
 - `--cases <N>`: behavior cases per file (default 20)
@@ -35,7 +35,7 @@ Every file in `migration-report.json` has one of:
 |---|---|
 | `verified` | Generated Rust compiles **and** matches the original behavior |
 | `compiled` | Generated Rust compiles; behavior was not checked |
-| `unsupported` | Input uses a construct outside the supported subset; no `.rs` is written |
+| `unsupported` | Reserved for language pairs without a verifier; no `.rs` is written |
 | `failed` | Translation was attempted but rejected (compile or behavior mismatch) |
 
 Top-level report keys: `verified`, `compiled`, `unsupported`, `failed`, `total`,
@@ -75,7 +75,5 @@ codemorph models validate
 | Variable | Meaning |
 |---|---|
 | `CODEMORPH_MODELS_ROOT` | Model registry root (`models/<role>/manifest.json`) |
-| `CODEMORPH_PYTHONPATH` | Python path for the optional model backend |
-| `CODEMORPH_PYTHON` | Python interpreter for the optional model backend |
-| `CODEMORPH_USE_MODEL=1` | Enable the experimental neural proposer |
-| `CODEMORPH_USE_OLLAMA=1` | Enable the Ollama teacher (Lab only) |
+| `CODEMORPH_PYTHONPATH` | Python path for the local model runtime |
+| `CODEMORPH_PYTHON` | Python interpreter for the local model runtime |

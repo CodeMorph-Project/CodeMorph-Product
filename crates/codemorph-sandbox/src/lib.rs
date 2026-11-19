@@ -1,3 +1,5 @@
+pub mod container;
+
 use codemorph_core::sandbox::{ExecutionRequest, ExecutionResult};
 use std::io::Read;
 use std::process::{Command, Stdio};

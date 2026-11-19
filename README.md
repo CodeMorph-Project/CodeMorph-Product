@@ -1,5 +1,7 @@
 # CodeMorph
 
+English · [Русский](README.ru.md)
+
 CodeMorph is an experimental platform for **verified** source-to-source program
 translation. C++ to Rust is the first supported direction; the architecture is
 intentionally generic so further language pairs can be added through adapters
@@ -20,50 +22,33 @@ supported subset) from `failed` (attempted but rejected).
 
 ## Current status
 
-The runtime product ships a **deterministic C++→Rust transpiler** for a
-conservative beginner subset (see below). It is the default translation path and
-requires no model, no network, and no Ollama.
+Migration produces Rust candidates with either an installed CodeMorph artifact
+or an explicitly enabled OpenAI-compatible endpoint. The first supported
+direction is C++ to Rust. See the [model setup guide](docs/model-backends.md).
 
-The neural translator in `models/translator/` is **experimental**: a small
-sequence-to-sequence model trained in the Lab. It is disabled by default and can
-only be used as an opt-in *proposer* (`CODEMORPH_USE_MODEL=1`); its output is
-still validated by the compiler and behavior checks before anything is accepted.
-It is not yet reliable enough to be a default, and this repository does not
-pretend otherwise.
+### Verification contract
 
-### Supported C++ subset (deterministic translator)
-
-- `#include` / `using namespace std;` / comments
-- `int main()` with `return 0;`
-- scalar declarations (`int`, `long`, `short`, `unsigned`, `size_t`, `double`,
-  `float`, `bool`, `char`) including comma declarations such as `int a, b;`
-- `std::string` values
-- `std::cin >> ...` chains (including `if (!(std::cin >> a >> b)) return 0;`)
-- `std::cout << ...` chains and `std::endl`
-- full expression precedence, ternary `?:`, prefix/postfix `++`/`--`
-- `if` / `else if` / `else`, `while`, `do-while`, C-style `for`, range `for`
-- simple `struct`s with methods and aggregate initialization
-- top-level free functions
-
-Anything outside this subset (templates, `class` with access specifiers,
-`unordered_map`/`map`/`vector`, `string_view`, `istringstream`, `unique_ptr`,
-`variant`, lambdas, `operator new`, `reinterpret_cast`, concepts, …) is reported
-as `unsupported` with the first offending construct named. No partial or
-garbage Rust is emitted for unsupported input.
+A file is `verified` only when the generated Rust compiles and matches the
+C++ program on seeded inputs. It is `compiled` when only compilation was
+checked, and `failed` when the model candidate was rejected. Inspect the report before using output. A candidate can compile and still fail behavioral verification.
 
 ## Quick start
 
-Requirements: Rust toolchain (`cargo`, `rustc`), a C/C++ compiler (`g++` or
-`clang++`).
+Requirements: Rust, Python 3.11+, and a running local Docker engine.
 
 ```sh
-cargo build --workspace
+docker pull rust:1-bookworm
+cargo build --locked --workspace
 ```
+
+Run `./bootstrap.sh` to build and install the CLI and Python runtime.
+The default executable directory is `~/.local/bin`. Override it with
+`CODEMORPH_INSTALL_DIR`.
 
 Migrate a directory of C++ files:
 
 ```sh
-./target/debug/codemorph migrate ./cpp --output ./rust --full
+./target/debug/codemorph migrate ./cpp --output ./migration-output --full
 ```
 
 `--full` enables behavior verification (compiles the original C++ and the
@@ -73,7 +58,7 @@ are only compile-checked and reported as `compiled`.
 The report is written to:
 
 ```text
-rust/.codemorph/migration-report.json
+migration-output/.codemorph/migration-report.json
 ```
 
 Example summary:
@@ -91,10 +76,8 @@ total: 12
 | Variable | Meaning |
 |---|---|
 | `CODEMORPH_MODELS_ROOT` | Directory containing `models/<role>/manifest.json` |
-| `CODEMORPH_PYTHONPATH` | Python package path for the optional model backend |
-| `CODEMORPH_PYTHON` | Python interpreter used for the optional model backend |
-| `CODEMORPH_USE_MODEL=1` | Enable the experimental neural proposer for unsupported files |
-| `CODEMORPH_USE_OLLAMA=1` | Enable the Ollama teacher (Lab/training only; never required for migration) |
+| `CODEMORPH_PYTHONPATH` | Python package path for the local model runtime |
+| `CODEMORPH_PYTHON` | Python interpreter used for the local model runtime |
 
 ## Repository layout
 
@@ -110,7 +93,7 @@ total: 12
 cargo fmt --check
 cargo clippy --workspace -- -D warnings
 cargo test --workspace
-python3 -m pytest python/tests
+PYTHONPATH=python python3 -m unittest discover -s python/tests
 ```
 
 ## Model artifacts
@@ -119,11 +102,18 @@ Models are not trained in the product runtime. They are installed from a Lab
 release bundle:
 
 ```sh
-python scripts/install_models.py --model-dir <artifact> --to models --role-name translator
+python ../CodeMorph-Lab/scripts/install_models.py --model-dir ARTIFACT --to models --role-name translator
 ```
 
 See `docs/models.md` and `docs/inference.md` for the registry contract.
 
 ## License
 
-Apache-2.0.
+Source is available for private, noncommercial evaluation by individuals.
+Organizational and commercial use requires a separate written license.
+See [LICENSE](LICENSE).
+
+## Public release status
+
+See the [publication checks](docs/public-release.md) and the
+[container execution boundary](docs/security.md).

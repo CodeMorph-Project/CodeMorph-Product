@@ -166,7 +166,7 @@ checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
 
 [[package]]
 name = "codemorph-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -190,7 +190,7 @@ dependencies = [
 
 [[package]]
 name = "codemorph-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -203,7 +203,7 @@ dependencies = [
 
 [[package]]
 name = "codemorph-cpp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "codemorph-core",
@@ -218,7 +218,7 @@ dependencies = [
 
 [[package]]
 name = "codemorph-ir"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "codemorph-core",
  "serde",
@@ -227,7 +227,7 @@ dependencies = [
 
 [[package]]
 name = "codemorph-models"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "codemorph-core",
@@ -240,7 +240,7 @@ dependencies = [
 
 [[package]]
 name = "codemorph-orchestrate"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "codemorph-core",
  "serde",
@@ -250,7 +250,7 @@ dependencies = [
 
 [[package]]
 name = "codemorph-project"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "codemorph-ir",
  "serde",
@@ -261,7 +261,7 @@ dependencies = [
 
 [[package]]
 name = "codemorph-rustlang"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "codemorph-core",
@@ -276,7 +276,7 @@ dependencies = [
 
 [[package]]
 name = "codemorph-sandbox"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "codemorph-core",
@@ -290,7 +290,7 @@ dependencies = [
 
 [[package]]
 name = "codemorph-verify"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "codemorph-core",
  "serde",

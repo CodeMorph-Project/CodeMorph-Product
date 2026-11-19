@@ -3,19 +3,22 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 BIN_DIR="${CODEMORPH_INSTALL_DIR:-$HOME/.local/bin}"
-mkdir -p "$BIN_DIR"
-
-echo "Installing CodeMorph into: $BIN_DIR"
-install -m 755 "$ROOT/target/release/codemorph" "$BIN_DIR/codemorph" 2>/dev/null || \
-install -m 755 "$ROOT/target/debug/codemorph" "$BIN_DIR/codemorph" 2>/dev/null || \
-{ echo "Build the project first: cargo build --workspace"; exit 1; }
-
-echo "Checking toolchain..."
-"$BIN_DIR/codemorph" check
-
-if [ -d "$ROOT/models" ]; then
-  echo "Model registry found in: $ROOT/models"
-  "$BIN_DIR/codemorph" models validate || true
+TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
+if [[ "$TARGET_DIR" != /* ]]; then
+  TARGET_DIR="$ROOT/$TARGET_DIR"
+fi
+BINARY="$TARGET_DIR/release/codemorph"
+if [[ ! -x "$BINARY" ]]; then
+  BINARY="$TARGET_DIR/debug/codemorph"
+fi
+if [[ ! -x "$BINARY" ]]; then
+  echo "Build the project first: cargo build --locked --release --workspace" >&2
+  exit 1
 fi
 
-echo "Done. Ensure $BIN_DIR is in PATH."
+RUNTIME="$BIN_DIR/../share/codemorph/python/codemorph_ml"
+mkdir -p "$BIN_DIR" "$RUNTIME"
+install -m 644 "$ROOT"/python/codemorph_ml/*.py "$RUNTIME/"
+install -m 755 "$BINARY" "$BIN_DIR/codemorph"
+"$BIN_DIR/codemorph" check
+echo "Installed $BIN_DIR/codemorph. Add $BIN_DIR to PATH to run codemorph."

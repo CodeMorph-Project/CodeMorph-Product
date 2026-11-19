@@ -19,6 +19,16 @@ pub struct ModelManifest {
     pub backend: String,
     pub artifact_format: String,
     pub protocol_version: String,
+    #[serde(default)]
+    pub schema_version: Option<String>,
+    #[serde(default)]
+    pub model_version: Option<String>,
+    #[serde(default)]
+    pub dataset_version: Option<String>,
+    #[serde(default)]
+    pub training_config_version: Option<String>,
+    #[serde(default)]
+    pub language_pair: Option<String>,
     pub hashes: std::collections::BTreeMap<String, String>,
 }
 

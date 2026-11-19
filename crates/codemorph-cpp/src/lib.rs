@@ -2,7 +2,6 @@ use codemorph_core::compiler::{CompileRequest, CompileResult, Compiler};
 use codemorph_core::language::{Language, LanguageFamily, LanguageId};
 use codemorph_core::traits::Adapter;
 use codemorph_core::Capability;
-use codemorph_sandbox::Sandbox;
 use std::path::PathBuf;
 use tempfile::TempDir;
 use which::which;
@@ -54,38 +53,17 @@ impl CppAdapter {
             };
         }
         let out = output.unwrap_or_else(|| dir.path().join("input.out"));
-        let compiler = match Self::compiler_path() {
-            Some(p) => p,
-            None => {
-                return CompileResult {
-                    success: false,
-                    output_path: None,
-                    stdout: String::new(),
-                    stderr: "no C++ compiler found".to_string(),
-                    diagnostics: vec!["no C++ compiler found".to_string()],
-                }
-            }
+        let flags = [
+            format!("-std={standard}"),
+            "-O1".into(),
+            "-Wall".into(),
+            "-Wextra".into(),
+        ];
+        let limits = codemorph_core::sandbox::ExecutionLimits {
+            timeout_ms: 60_000,
+            ..Default::default()
         };
-        let req = codemorph_core::sandbox::ExecutionRequest {
-            program: compiler.to_string_lossy().to_string(),
-            args: vec![
-                "-std=".to_string() + standard,
-                "-O1".to_string(),
-                "-Wall".to_string(),
-                "-Wextra".to_string(),
-                src.to_string_lossy().to_string(),
-                "-o".to_string(),
-                out.to_string_lossy().to_string(),
-            ],
-            cwd: None,
-            env: vec![],
-            stdin: None,
-            limits: codemorph_core::sandbox::ExecutionLimits {
-                timeout_ms: 60_000,
-                ..Default::default()
-            },
-        };
-        match Sandbox::execute(&req) {
+        match codemorph_sandbox::container::compile("g++", &flags, &src, &out, &limits) {
             Ok(res) => {
                 let success = res.exit_code == Some(0) && out.exists();
                 CompileResult {
@@ -144,18 +122,6 @@ impl CppAdapter {
             };
         }
         let out = output.unwrap_or_else(|| dir.path().join("input.out"));
-        let compiler = match Self::compiler_path() {
-            Some(p) => p,
-            None => {
-                return CompileResult {
-                    success: false,
-                    output_path: None,
-                    stdout: String::new(),
-                    stderr: "no C++ compiler found".to_string(),
-                    diagnostics: vec!["no C++ compiler found".to_string()],
-                }
-            }
-        };
         let mut args = vec![
             "-std=".to_string() + standard,
             "-O1".to_string(),
@@ -166,21 +132,11 @@ impl CppAdapter {
             args.push(format!("-fsanitize={}", s));
             args.push("-fno-omit-frame-pointer".to_string());
         }
-        args.push(src.to_string_lossy().to_string());
-        args.push("-o".to_string());
-        args.push(out.to_string_lossy().to_string());
-        let req = codemorph_core::sandbox::ExecutionRequest {
-            program: compiler.to_string_lossy().to_string(),
-            args,
-            cwd: None,
-            env: vec![],
-            stdin: None,
-            limits: codemorph_core::sandbox::ExecutionLimits {
-                timeout_ms: 120_000,
-                ..Default::default()
-            },
+        let limits = codemorph_core::sandbox::ExecutionLimits {
+            timeout_ms: 120_000,
+            ..Default::default()
         };
-        match Sandbox::execute(&req) {
+        match codemorph_sandbox::container::compile("g++", &args, &src, &out, &limits) {
             Ok(res) => {
                 let success = res.exit_code == Some(0) && out.exists();
                 CompileResult {

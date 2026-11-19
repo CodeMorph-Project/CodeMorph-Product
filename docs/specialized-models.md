@@ -11,26 +11,25 @@ Roles and the pipeline hook that consumes (or will consume) them:
 | `ownership`    | Classify safe/unsafe, lifetime/invariant policy      | `--stage ownership`                       |
 | `idiomatizer`  | API/standard-library mapping + idiomatic Rust       | `--stage idiomatize`                      |
 | `performance`  | Performance/bundle targets                          | reserved (no automatic hook yet)          |
+| `security`     | Security-relevant constructs and checks             | reserved (no automatic hook yet)          |
 
 ## Current status
 
-As of the 2026-11-08 pass, the trained role checkpoints are small Seq2Seq GRU
-models (`60m`, 58 M parameters) trained on the verified corpus. Their inference
-is **experimental**: in a smoke test the output is non-idiomatic and often does
-not compile. They are therefore **opt-in only** (`CODEMORPH_USE_MODEL=1` for
-translator proposals/repair; stages `ownership`/`idiomatize` run them directly).
+As of the 2026-11-17 pass, models are versioned `TransformerSeq2Seq-v2`
+artifacts. The translator is `30m-v2-20261117` (~30 M parameters) trained on
+compiler-verified C++/Rust pairs. The deterministic transpiler and all external
+teacher models have been removed: translation is performed by the local model
+alone.
 
-Deterministic translation and behavior verification remain the authority. The
-specialized models are *proposers* — their output is never trusted until the
-compiler and behavior checks accept it. This aligns with AGENTS.md:
-neural networks propose, compilers/tests/verifiers decide.
+Compilation and behavior verification remain the authority. Specialized models
+are *proposers* — output is never trusted until the verifier accepts it.
 
 ## Design targets (roadmap)
 
 - **API/library mapping model**: map `std::vector`, `std::map`, `std::string_view`,
   plus enterprise frameworks (Boost, Qt, POCO) to idiomatic Rust crates
-  (`Vec`, `HashMap`, `&str`, `tokio`, ...). Today the deterministic translator
-  provides crate/type *hints* via `unsupported construct: X (suggest: Y)`.
+  (`Vec`, `HashMap`, `&str`, `tokio`, ...). This is now learned from verified
+  parallel corpora rather than emitted by an algorithmic translator.
 - **Unsafe detection model**: walk ownership/pointer graphs; mark safe regions
   with lifetimes and isolate genuinely unsafe regions behind `unsafe` with
   checked invariants.
@@ -39,8 +38,10 @@ neural networks propose, compilers/tests/verifiers decide.
 
 ## Versioning
 
-Training artifacts carry a `version` field in `manifest.json` and a `-tag`
-suffix when retraining:
-`outputs/model_artifacts/<role>-<size>[-v2]` (`--run-tag v2` in `train_role.py`).
-Models are swapped through the validated installer (`scripts/install_models.py`),
-never committed. The runtime prefers `models/<role>/manifest.json`.
+Training artifacts declare `schema_version`, `model_version`,
+`training_config_version`, `dataset_version`, `language_pair`, `architecture`
+and `parameter_count` in both `model_config.json` and `manifest.json`.
+Directory names are `outputs/model_artifacts/<role>-<version>`. Configs live in
+`language_pairs/<pair>/configs/` with the same version fields. Models are
+swapped through the validated installer, never committed. The runtime prefers
+an explicit `--model-dir`, then the newest `models/translator-*` artifact.
