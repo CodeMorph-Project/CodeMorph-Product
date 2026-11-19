@@ -33,9 +33,19 @@ fn hex(bytes: &[u8]) -> String {
     s
 }
 
+/// Analyze a source file or walk a project directory without following nested symlinks.
 pub fn analyze(root: &Path) -> ProjectIr {
     let mut ir = ProjectIr::new(root.display().to_string());
-    walk(root, root, &mut ir);
+    if root.is_file() {
+        record_file(
+            root.parent().unwrap_or_else(|| Path::new("")),
+            root,
+            &mut ir,
+        );
+    } else {
+        walk(root, root, &mut ir);
+    }
+    ir.files.sort_by(|left, right| left.path.cmp(&right.path));
     ir
 }
 
@@ -44,23 +54,28 @@ fn walk(root: &Path, dir: &Path, ir: &mut ProjectIr) {
         return;
     };
     for entry in read.flatten() {
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
         let path = entry.path();
-        if path.is_dir() {
+        if kind.is_dir() {
             walk(root, &path, ir);
-        } else if let Some(lang) = detect_language(&path) {
-            let rel = path
-                .strip_prefix(root)
-                .unwrap_or(&path)
-                .display()
-                .to_string();
-            let hash = sha256_file(&path).unwrap_or_default();
-            ir.files.push(ProjectFile {
-                path: rel,
-                language: lang.to_string(),
-                hash,
-            });
+        } else if kind.is_file() {
+            record_file(root, &path, ir);
         }
     }
+}
+
+fn record_file(root: &Path, path: &Path, ir: &mut ProjectIr) {
+    let Some(language) = detect_language(path) else {
+        return;
+    };
+    let relative = path.strip_prefix(root).unwrap_or(path);
+    ir.files.push(ProjectFile {
+        path: relative.display().to_string(),
+        language: language.to_string(),
+        hash: sha256_file(path).unwrap_or_default(),
+    });
 }
 
 #[cfg(test)]
@@ -75,5 +90,16 @@ mod tests {
         fs::write(dir.path().join("lib.rs"), "fn main(){}").unwrap();
         let ir = analyze(dir.path());
         assert_eq!(ir.files.len(), 2);
+    }
+
+    #[test]
+    fn analyzes_single_file() {
+        let dir = TempDir::new().unwrap();
+        let input = dir.path().join("main.cpp");
+        fs::write(&input, "int main(){}").unwrap();
+        let ir = analyze(&input);
+        assert_eq!(ir.files.len(), 1);
+        assert_eq!(ir.files[0].path, "main.cpp");
+        assert_eq!(ir.files[0].hash, sha256_file(&input).unwrap());
     }
 }

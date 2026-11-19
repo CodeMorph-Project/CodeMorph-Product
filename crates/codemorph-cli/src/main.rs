@@ -53,16 +53,25 @@ enum Commands {
         input: PathBuf,
         #[arg(long)]
         output: PathBuf,
-        #[arg(long, default_value = "all")]
+        #[arg(long, default_value = "all", value_parser = [
+            "all", "analyze", "translate", "repair", "verify", "ownership",
+            "idiomatize", "planner", "performance", "security", "ffi",
+        ])]
         stage: String,
+        /// Compare behavior on seeded inputs in the default pipeline.
         #[arg(long)]
         full: bool,
         #[arg(long)]
         include_stages: Option<String>,
         #[arg(long)]
         skip_stages: Option<String>,
+        #[arg(long, default_value = "cpp")]
+        source_lang: String,
+        #[arg(long, default_value = "rust")]
+        target_lang: String,
+        /// Translator profile directory with manifest.json.
         #[arg(long)]
-        use_ollama: bool,
+        model_dir: Option<PathBuf>,
         #[arg(long, default_value = "20")]
         cases: usize,
         #[arg(long, default_value = "7")]
@@ -104,7 +113,31 @@ fn main() {
             input,
             iterations,
         } => commands::benchmark(cpp_source, rust_source, input, iterations),
-        Commands::Migrate { input, output, stage, full, use_ollama, cases, seed, include_stages, skip_stages } => commands::migrate(input, output, stage, full, use_ollama, cases, seed, include_stages, skip_stages),
+        Commands::Migrate {
+            input,
+            output,
+            stage,
+            full,
+            source_lang,
+            target_lang,
+            model_dir,
+            cases,
+            seed,
+            include_stages,
+            skip_stages,
+        } => commands::migrate(
+            input,
+            output,
+            stage,
+            full,
+            source_lang,
+            target_lang,
+            model_dir,
+            cases,
+            seed,
+            include_stages,
+            skip_stages,
+        ),
         Commands::Models { command } => match command {
             ModelCommands::List => commands::models_list(),
             ModelCommands::Validate => commands::models_validate(),

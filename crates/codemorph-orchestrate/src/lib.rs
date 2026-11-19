@@ -138,7 +138,7 @@ mod tests {
     fn persists_and_loads() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("job.json");
-        let mut job = MigrationJob::new("j", "in", "out");
+        let job = MigrationJob::new("j", "in", "out");
         job.save(&path).unwrap();
         let loaded = MigrationJob::load(&path).unwrap();
         assert_eq!(loaded.id, "j");

@@ -1,98 +1,119 @@
 # CodeMorph
 
-CodeMorph is an experimental platform for verified neural source-to-source program translation.
+English · [Русский](README.ru.md)
 
-C++ to Rust is the first supported translation direction. The architecture is intentionally generic so additional source/target languages can be added through adapters and translation-direction plugins without rewriting the core.
+CodeMorph is an experimental platform for **verified** source-to-source program
+translation. C++ to Rust is the first supported direction; the architecture is
+intentionally generic so further language pairs can be added through adapters
+and translation-direction plugins.
 
 ## Core principle
 
-- Neural networks propose candidates.
-- Compilers and verifiers decide correctness.
-- The orchestrator decides what to do next.
+- Deterministic analysis and translation are preferred over model generation.
+- Neural models only ever *propose* candidates.
+- Compilers and behavior tests decide correctness.
+- Nothing is reported as translated unless it compiles, and nothing is reported
+  as verified unless it also behaves like the original.
 
-CodeMorph separates deterministic analysis and verification from learned generation. Verifiers are mandatory, and translated Rust is never considered correct only because it compiles.
+A translation is never accepted merely because it compiles. The migration
+report distinguishes `verified` (compiles **and** matches behavior) from
+`compiled` (compiles, behavior not checked) from `unsupported` (outside the
+supported subset) from `failed` (attempted but rejected).
 
 ## Current status
 
-This repository is at an early implementation stage. Core abstractions, documentation, and the first C++/Rust vertical slices are being built. See `docs/roadmap.md`.
+Migration produces Rust candidates with either an installed CodeMorph artifact
+or an explicitly enabled OpenAI-compatible endpoint. The first supported
+direction is C++ to Rust. See the [model setup guide](docs/model-backends.md).
+
+### Verification contract
+
+A file is `verified` only when the generated Rust compiles and matches the
+C++ program on seeded inputs. It is `compiled` when only compilation was
+checked, and `failed` when the model candidate was rejected. Inspect the report before using output. A candidate can compile and still fail behavioral verification.
 
 ## Quick start
 
-Requirements for the current C++ to Rust slice:
-
-- Rust toolchain (`cargo`, `rustc`)
-- C/C++ toolchain (`clang`, `clang++`)
-- Python 3.11 or newer
-
-Build:
+Requirements: Rust, Python 3.11+, and a running local Docker engine.
 
 ```sh
-cargo build --workspace
+docker pull rust:1-bookworm
+cargo build --locked --workspace
 ```
 
-Run tests:
+Run `./bootstrap.sh` to build and install the CLI and Python runtime.
+The default executable directory is `~/.local/bin`. Override it with
+`CODEMORPH_INSTALL_DIR`.
+
+Migrate a directory of C++ files:
 
 ```sh
-cargo test --workspace
-python3 -m pytest python/tests 2>/dev/null || true
+./target/debug/codemorph migrate ./cpp --output ./migration-output --full
 ```
 
-CLI (planned):
+`--full` enables behavior verification (compiles the original C++ and the
+generated Rust and compares stdout over seeded inputs). Without `--full`, files
+are only compile-checked and reported as `compiled`.
 
-```sh
-migrate ./cpp-project --output ./rust-project
+The report is written to:
+
+```text
+migration-output/.codemorph/migration-report.json
 ```
+
+Example summary:
+
+```text
+verified: 8
+compiled: 0
+unsupported: 4
+failed: 0
+total: 12
+```
+
+### Environment variables
+
+| Variable | Meaning |
+|---|---|
+| `CODEMORPH_MODELS_ROOT` | Directory containing `models/<role>/manifest.json` |
+| `CODEMORPH_PYTHONPATH` | Python package path for the local model runtime |
+| `CODEMORPH_PYTHON` | Python interpreter used for the local model runtime |
 
 ## Repository layout
 
 - `crates/`: Rust core, adapters, CLI, verification, sandbox
-- `python/`: machine learning, tokenizers, training
-- `docs/`: architecture, roadmap, decisions
-- `configs/`: datasets, models, training, evaluation
+- `python/`: model runtime, tokenizers, inference
+- `docs/`: architecture, usage, roadmap, decisions
 - `fixtures/`: small reproducible test projects
-- `experiments/`: experiment definitions
+- `models/`: installed model registry (weights are never committed)
 
-## License
+## Tests
 
-See `LICENSE` once published.>
+```sh
+cargo fmt --check
+cargo clippy --workspace -- -D warnings
+cargo test --workspace
+PYTHONPATH=python python3 -m unittest discover -s python/tests
+```
 
 ## Model artifacts
 
-CodeMorph resolves models through a local registry:
-
-```text
-models/<role>/manifest.json
-```
-
-Models are not trained in product runtime. They are installed from a
-CodeMorph Lab release bundle with `tools/install_models.py`.
-
-## Quick start
-
-Install a translator model into the runtime registry:
+Models are not trained in the product runtime. They are installed from a Lab
+release bundle:
 
 ```sh
-export CODEMORPH_OLLAMA_MODEL=beam:cloud
+python ../CodeMorph-Lab/scripts/install_models.py --model-dir ARTIFACT --to models --role-name translator
 ```
 
-Run migration:
+See `docs/models.md` and `docs/inference.md` for the registry contract.
 
-```sh
-codemorph migrate ./cpp-project --output ./rust-project
-```
+## License
 
-Each supported source file is translated with Ollama, checked with
-`rustc`, and optionally repaired once using compiler diagnostics. The final
-report is written to:
+Source is available for private, noncommercial evaluation by individuals.
+Organizational and commercial use requires a separate written license.
+See [LICENSE](LICENSE).
 
-```text
-rust-project/.codemorph/migration-report.json
-```
+## Public release status
 
-## Install from source
-
-```sh
-cd CodeMorph-Product
-cargo build --workspace --release
-./install.sh
-```
+See the [publication checks](docs/public-release.md) and the
+[container execution boundary](docs/security.md).

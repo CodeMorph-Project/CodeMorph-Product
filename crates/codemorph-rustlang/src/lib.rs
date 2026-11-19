@@ -1,9 +1,8 @@
 use codemorph_core::compiler::{CompileRequest, CompileResult, Compiler};
 use codemorph_core::language::{Language, LanguageFamily, LanguageId};
-use codemorph_core::sandbox::{ExecutionLimits, ExecutionRequest};
+use codemorph_core::sandbox::ExecutionLimits;
 use codemorph_core::traits::Adapter;
 use codemorph_core::Capability;
-use codemorph_sandbox::Sandbox;
 use std::path::PathBuf;
 use tempfile::TempDir;
 use which::which;
@@ -31,7 +30,9 @@ impl RustAdapter {
     pub fn compiler_path() -> Option<PathBuf> {
         if let Ok(value) = std::env::var("CODEMORPH_RUSTC") {
             let path = PathBuf::from(value);
-            if path.exists() { return Some(path); }
+            if path.exists() {
+                return Some(path);
+            }
         }
         if let Ok(path) = which("rustc") {
             // Avoid the i386/old wrappers from /usr/local/bin on some machines.
@@ -43,19 +44,33 @@ impl RustAdapter {
             let toolchains = PathBuf::from(home).join(".rustup").join("toolchains");
             if toolchains.exists() {
                 let mut candidates = Vec::new();
-                for entry in std::fs::read_dir(&toolchains).into_iter().flatten() {
-                    if let Ok(entry) = entry {
-                        let candidate = entry.path().join("bin").join("rustc");
-                        if candidate.exists() { candidates.push(candidate); }
+                for entry in std::fs::read_dir(&toolchains)
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                {
+                    let candidate = entry.path().join("bin").join("rustc");
+                    if candidate.exists() {
+                        candidates.push(candidate);
                     }
                 }
                 candidates.sort();
-                if let Some(path) = candidates.into_iter().last() { return Some(path); }
+                if let Some(path) = candidates.into_iter().last() {
+                    return Some(path);
+                }
             }
         }
         for candidate in ["/opt/homebrew/bin/rustc", "/usr/local/bin/rustc", "rustc"] {
             let path = PathBuf::from(candidate);
-            if path.exists() { return Some(path); }
+            if path.exists() {
+                return Some(path);
+            }
+        }
+        // Last resort: any rustc on PATH (supports non-rustup installs).
+        if let Ok(path) = which::which("rustc") {
+            if path.exists() {
+                return Some(path);
+            }
         }
         None
     }
@@ -84,35 +99,11 @@ impl RustAdapter {
             };
         }
         let out = output.unwrap_or_else(|| dir.path().join("input.out"));
-        let compiler = match Self::compiler_path() {
-            Some(p) => p,
-            None => {
-                return CompileResult {
-                    success: false,
-                    output_path: None,
-                    stdout: String::new(),
-                    stderr: "no Rust compiler found".to_string(),
-                    diagnostics: vec!["no Rust compiler found".to_string()],
-                }
-            }
+        let limits = ExecutionLimits {
+            timeout_ms: 120_000,
+            ..Default::default()
         };
-        let req = ExecutionRequest {
-            program: compiler.to_string_lossy().to_string(),
-            args: vec![
-                src.to_string_lossy().to_string(),
-                "-O".to_string(),
-                "-o".to_string(),
-                out.to_string_lossy().to_string(),
-            ],
-            cwd: None,
-            env: vec![],
-            stdin: None,
-            limits: ExecutionLimits {
-                timeout_ms: 120_000,
-                ..Default::default()
-            },
-        };
-        match Sandbox::execute(&req) {
+        match codemorph_sandbox::container::compile("rustc", &["-O".into()], &src, &out, &limits) {
             Ok(res) => {
                 let success = res.exit_code == Some(0) && out.exists();
                 CompileResult {
